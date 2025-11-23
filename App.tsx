@@ -21,7 +21,7 @@ import {
   INVENTORY_LIMITS
 } from './constants';
 import { generateAiPurchases } from './services/geminiService';
-import { Skull, Crown, Users, Copy, Loader2, RefreshCw, Server, WifiOff } from 'lucide-react';
+import { Skull, Crown, Users, Copy, Loader2, RefreshCw, Server, WifiOff, ShieldCheck } from 'lucide-react';
 
 // Declare MQTT global from script tag
 declare const mqtt: any;
@@ -50,9 +50,16 @@ const calculateStats = (player: Player): Stats => {
   return stats;
 };
 
-// Use a public MQTT Broker via WebSockets
-const MQTT_BROKER_URL = 'wss://broker.emqx.io:8084/mqtt';
-const TOPIC_PREFIX = 'souls-arena-game/v2/';
+// --- BROKER CONFIGURATION ---
+// We use a list of public brokers to ensure connectivity even if one is down or blocked.
+// Priority: 443 (HTTPS standard) -> 8000 -> 8084
+const BROKERS = [
+    { url: 'wss://mqtt.eclipseprojects.io:443/mqtt', name: 'Eclipse Cloud (443)' },
+    { url: 'wss://broker.hivemq.com:8000/mqtt', name: 'HiveMQ Public (8000)' },
+    { url: 'wss://broker.emqx.io:8084/mqtt', name: 'EMQX Global (8084)' }
+];
+
+const TOPIC_PREFIX = 'souls-arena/v3/';
 
 export default function App() {
   // --- STATE ---
@@ -76,24 +83,20 @@ export default function App() {
   const [myPlayerId, setMyPlayerId] = useState<string>('');
   const [isConnected, setIsConnected] = useState(false);
   const [netStatus, setNetStatus] = useState<string>('离线');
+  const [currentBrokerName, setCurrentBrokerName] = useState<string>('');
   
   // REFS for Networking and Logic
   const mqttClientRef = useRef<any>(null);
   const isHostRef = useRef(false);
   const gameStateRef = useRef(gameState);
   const startingBattleRef = useRef(false);
+  const brokerIndexRef = useRef(0);
 
   // Sync refs
   useEffect(() => { isHostRef.current = isHost; }, [isHost]);
   useEffect(() => { gameStateRef.current = gameState; }, [gameState]);
 
   // --- MQTT HELPERS ---
-
-  // Topics:
-  // Host Listens: TOPIC_PREFIX + code + '/server' (INCOMING ACTIONS)
-  // Host Publishes: TOPIC_PREFIX + code + '/client' (GAME STATE)
-  // Client Listens: TOPIC_PREFIX + code + '/client'
-  // Client Publishes: TOPIC_PREFIX + code + '/server'
 
   const getMyPublishTopic = (code: string) => {
       return isHostRef.current 
@@ -119,11 +122,20 @@ export default function App() {
     if (!amIHost) {
       if (msg.type === 'SYNC' || msg.type === 'WELCOME') {
         const serverState = msg.payload as GameState;
-        if (!isConnected) {
-            setIsConnected(true);
-            setNetStatus("已连接服务器");
+        
+        // Ensure I exist in the received state before accepting it entirely
+        // This prevents accepting "empty" room states if the host reset
+        const myPlayerExists = serverState.players.some(p => p.id === myPlayerId);
+        
+        if (msg.type === 'WELCOME' || myPlayerExists) {
+            if (!isConnected) {
+                setIsConnected(true);
+            }
+            setGameState(serverState);
+        } else if (isConnected && !myPlayerExists) {
+            // Disconnected or kicked?
+            // console.warn("Received state without my player data");
         }
-        setGameState(serverState);
       }
       return;
     } 
@@ -151,7 +163,7 @@ export default function App() {
         };
 
         setGameState(newState);
-        // Important: Wait a tick for React state to potentially settle, then broadcast
+        // Delay to allow React state update
         setTimeout(() => send({ type: 'WELCOME', payload: newState }), 50);
         return;
       }
@@ -175,33 +187,38 @@ export default function App() {
          });
       }
     }
-  }, [send, isConnected]); 
+  }, [send, isConnected, myPlayerId]); 
 
-  // --- INITIALIZE MQTT ---
+  // --- INITIALIZE MQTT WITH FALLBACK ---
   const connectMqtt = (code: string, isHostRole: boolean) => {
+      // Cleanup previous
       if (mqttClientRef.current) {
-          mqttClientRef.current.end();
+          try { mqttClientRef.current.end(); } catch(e) {}
       }
 
-      setNetStatus('正在连接中继服务器...');
+      const broker = BROKERS[brokerIndexRef.current];
+      setNetStatus(`连接中: ${broker.name}...`);
+      setCurrentBrokerName(broker.name);
       
       const clientId = `souls-${Math.random().toString(16).substr(2, 8)}`;
-      const client = mqtt.connect(MQTT_BROKER_URL, {
+      
+      console.log(`Attempting connection to ${broker.url}`);
+
+      const client = mqtt.connect(broker.url, {
           clientId,
           clean: true,
-          connectTimeout: 4000,
+          connectTimeout: 5000, 
+          reconnectPeriod: 0 // Disable auto-reconnect to handle failover manually
       });
 
       client.on('connect', () => {
-          // console.log('MQTT Connected');
-          setNetStatus(isHostRole ? '房间已创建 (在线)' : '已连接中继，正在同步...');
+          console.log(`Connected to ${broker.name}`);
+          setNetStatus(isHostRole ? '房间在线' : '已连接服务器');
           
           if (isHostRole) {
               setIsConnected(true);
-              // Host subscribes to incoming actions from clients
               client.subscribe(`${TOPIC_PREFIX}${code}/server`);
           } else {
-              // Client subscribes to game state updates
               client.subscribe(`${TOPIC_PREFIX}${code}/client`);
               // Send JOIN immediately once connected
               setTimeout(() => {
@@ -223,18 +240,42 @@ export default function App() {
       });
 
       client.on('error', (err: any) => {
-          console.error('MQTT Error:', err);
-          setNetStatus('连接错误');
+          console.error(`MQTT Error on ${broker.name}:`, err);
+          handleConnectionFail(code, isHostRole);
       });
       
-      client.on('reconnect', () => {
-          setNetStatus('正在重连...');
-      });
+      // If connection takes too long, force failover
+      setTimeout(() => {
+          if (!client.connected) {
+              handleConnectionFail(code, isHostRole);
+          }
+      }, 6000);
 
       mqttClientRef.current = client;
   };
 
-  // HOST HEARTBEAT: Broadcast state every 1.5s via MQTT
+  const handleConnectionFail = (code: string, isHostRole: boolean) => {
+      if (isConnected) return; // If already connected, ignore
+      
+      if (mqttClientRef.current) {
+         try { mqttClientRef.current.end(); } catch(e){}
+      }
+
+      // Try next broker
+      brokerIndexRef.current = (brokerIndexRef.current + 1);
+      
+      if (brokerIndexRef.current >= BROKERS.length) {
+          brokerIndexRef.current = 0; // Loop back or stop? Let's loop.
+          setNetStatus("所有服务器连接失败，正在重试...");
+          // Wait a bit before restarting loop
+          setTimeout(() => connectMqtt(code, isHostRole), 2000);
+      } else {
+          // Try next immediately
+          connectMqtt(code, isHostRole);
+      }
+  };
+
+  // HOST HEARTBEAT: Broadcast state frequently
   useEffect(() => {
     if (!isHost || !gameState.roomCode) return;
     
@@ -242,10 +283,31 @@ export default function App() {
         if (gameStateRef.current.phase !== GamePhase.LOGIN && mqttClientRef.current?.connected) {
             send({ type: 'SYNC', payload: gameStateRef.current });
         }
-    }, 1500);
+    }, 1000); // 1s Heartbeat
 
     return () => clearInterval(interval);
   }, [isHost, send]); 
+  
+  // CLIENT RE-JOIN: If stuck in waiting but connected, resend JOIN
+  useEffect(() => {
+      if (isHost || !isConnected || gameState.phase !== GamePhase.WAITING_FOR_OPPONENT) return;
+      
+      const interval = setInterval(() => {
+          // Keep knocking until phase changes
+          if (mqttClientRef.current?.connected) {
+             const code = gameState.roomCode;
+             if (code) {
+                 mqttClientRef.current.publish(`${TOPIC_PREFIX}${code}/server`, JSON.stringify({ 
+                     type: 'JOIN', 
+                     payload: { id: myPlayerId, name: localPlayerName } 
+                 }));
+             }
+          }
+      }, 2000);
+      
+      return () => clearInterval(interval);
+  }, [isHost, isConnected, gameState.phase, myPlayerId, localPlayerName, gameState.roomCode]);
+
 
   // --- HELPER LOGIC (Purchasing, Battle) ---
   const processBuyItem = (state: GameState, playerId: string, itemId: string): GameState => {
@@ -280,6 +342,7 @@ export default function App() {
   };
 
   const handleCreateRoom = (mode: 'PVE' | 'PVP') => {
+    // 4 digit code for simplicity
     const code = Math.floor(1000 + Math.random() * 9000).toString();
     
     setGameState(prev => ({
@@ -563,7 +626,9 @@ export default function App() {
   };
 
   const resetGame = () => {
-    if (mqttClientRef.current) mqttClientRef.current.end();
+    if (mqttClientRef.current) {
+        try { mqttClientRef.current.end(); } catch (e) {}
+    }
     
     setGameState({
       phase: GamePhase.LOBBY,
@@ -579,6 +644,7 @@ export default function App() {
     setIsHost(false);
     setIsConnected(false);
     setNetStatus('离线');
+    brokerIndexRef.current = 0;
   };
 
   // --- RENDERS ---
@@ -659,9 +725,10 @@ export default function App() {
                 <div className="text-center">
                     <h2 className="text-2xl font-display text-white mb-2">等待挑战者...</h2>
                     <p className="text-souls-muted mb-2">分享此代码给你的对手 (不同设备可用)</p>
-                    <p className="text-xs text-blue-400 mb-6 font-mono flex items-center justify-center gap-2">
-                        <Server size={12}/> {netStatus}
-                    </p>
+                    <div className="text-xs text-blue-400 mb-6 font-mono flex flex-col items-center justify-center gap-1">
+                        <span className="flex items-center gap-2"><Server size={12}/> {netStatus}</span>
+                        {currentBrokerName && <span className="opacity-50">节点: {currentBrokerName}</span>}
+                    </div>
 
                     <div className="flex items-center gap-4 bg-souls-gray/30 p-4 rounded border border-souls-gold/30">
                         <span className="text-4xl font-mono font-bold text-souls-gold tracking-[0.5em]">{gameState.roomCode}</span>
@@ -684,8 +751,10 @@ export default function App() {
                     <div className="flex flex-col items-center gap-4">
                         <RefreshCw className="w-16 h-16 text-souls-red animate-spin" />
                         <h2 className="text-2xl font-display text-white">正在入侵世界 {gameState.roomCode}...</h2>
-                        <p className="text-souls-muted">正在连接中继服务器...</p>
-                        <p className="text-xs text-blue-400 font-mono">{netStatus}</p>
+                        <p className="text-souls-muted">正在尝试建立连接...</p>
+                        <div className="text-xs text-blue-400 font-mono flex flex-col items-center">
+                            <span>{netStatus}</span>
+                        </div>
                     </div>
                 )}
              </>
@@ -699,15 +768,17 @@ export default function App() {
   return (
     <Layout>
       {gameState.roomCode && (
-          <div className="absolute top-4 right-4 z-50 bg-black/50 px-3 py-1 border border-white/10 text-xs text-souls-muted font-mono flex gap-2 items-center">
-              <span>ROOM: {gameState.roomCode}</span>
-              <span>|</span>
+          <div className="absolute top-4 right-4 z-50 bg-black/80 px-4 py-2 border border-white/10 text-xs text-souls-muted font-mono flex gap-3 items-center rounded shadow-lg">
+              <span>ROOM: <span className="text-white font-bold">{gameState.roomCode}</span></span>
+              <span className="h-3 w-px bg-white/20"></span>
               <span className={isHost ? 'text-souls-gold' : 'text-blue-400'}>{isHost ? 'HOST' : 'CLIENT'}</span>
-              <span>|</span>
-              {isConnected ? <Server size={14} className="text-green-500"/> : <WifiOff size={14} className="text-red-500"/>}
-              <span className={isConnected ? 'text-green-500' : 'text-red-500'}>
-                  {isConnected ? 'ONLINE' : 'CONNECTING...'}
-              </span>
+              <span className="h-3 w-px bg-white/20"></span>
+              <div className="flex items-center gap-1">
+                 {isConnected ? <ShieldCheck size={14} className="text-green-500"/> : <WifiOff size={14} className="text-red-500"/>}
+                 <span className={isConnected ? 'text-green-500' : 'text-red-500'}>
+                    {isConnected ? '已连接' : '连接中...'}
+                 </span>
+              </div>
           </div>
       )}
 
