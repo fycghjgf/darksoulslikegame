@@ -83,23 +83,26 @@ export default function App() {
   // --- NETWORKING HELPERS ---
   const broadcast = useCallback((msg: NetworkMessage) => {
     if (channelRef.current) {
-      channelRef.current.postMessage(msg);
+      try {
+        channelRef.current.postMessage(msg);
+      } catch (e) {
+        console.error("Broadcast failed", e);
+      }
     }
   }, []);
 
-  // HOST HEARTBEAT: Broadcast state every 2s to ensure clients sync even if they miss packets
+  // HOST HEARTBEAT: Broadcast state every 2s
   useEffect(() => {
     if (!isHost || !gameState.roomCode) return;
     
     const interval = setInterval(() => {
-        // Only broadcast if we have players (or waiting for them)
         if (gameStateRef.current.phase !== GamePhase.LOGIN) {
             broadcast({ type: 'SYNC', payload: gameStateRef.current });
         }
     }, 2000);
 
     return () => clearInterval(interval);
-  }, [isHost, broadcast]); // Intentionally minimal dependencies, uses gameStateRef
+  }, [isHost, broadcast]); 
 
   // Helper to process a buy action (state update only)
   const processBuyItem = (state: GameState, playerId: string, itemId: string): GameState => {
@@ -108,7 +111,6 @@ export default function App() {
       if (!player || !item) return state;
       if (player.souls < item.cost) return state;
 
-      // CHECK LIMITS
       const typeCount = player.inventory.filter(i => i.type === item.type).length;
       if (typeCount >= INVENTORY_LIMITS[item.type]) {
           return state;
@@ -145,9 +147,6 @@ export default function App() {
              }
              setIsConnected(true);
              setGameState(serverState);
-        } else {
-             // FAILURE: I am not in the list yet. Keep retrying (handled by handleJoinRoom interval)
-             // But we can optionally sync the phase if we want to see the lobby
         }
       }
       return;
@@ -155,36 +154,38 @@ export default function App() {
 
     // --- HOST LOGIC ---
     if (amIHost) {
-      const current = gameStateRef.current;
-
       if (msg.type === 'JOIN') {
-        // Idempotency check: Is player already in?
-        const existingPlayer = current.players.find(p => p.id === msg.payload.id);
+        const { id, name } = msg.payload;
+        
+        // CRITICAL FIX: Determine action based on REF to avoid race conditions
+        const currentState = gameStateRef.current;
+        const existingPlayer = currentState.players.find(p => p.id === id);
+        
         if (existingPlayer) {
-            // Already joined, just resend state immediately so they stop asking
-            broadcast({ type: 'SYNC', payload: current });
+            // Already joined? Just send them the state immediately.
+            broadcast({ type: 'SYNC', payload: currentState });
+            return;
+        }
+
+        if (currentState.players.length >= 2) {
+            // Room full? Ignore or send error (optional)
             return;
         }
 
         // Add new player
-        setGameState(prev => {
-           // Double check inside setter to prevent race conditions
-           if (prev.players.find(p => p.id === msg.payload.id)) return prev;
-           
-           // If p2 spot is taken by someone else, ignore
-           if (prev.players.length >= 2) return prev;
+        const p2 = createPlayer(id, name, false);
+        const newState = {
+            ...currentState,
+            players: [...currentState.players, p2],
+            phase: GamePhase.SHOP
+        };
 
-           const p2 = createPlayer(msg.payload.id, msg.payload.name, false);
-           const newState = {
-             ...prev,
-             players: [...prev.players, p2],
-             phase: GamePhase.SHOP
-           };
-           
-           // Immediate response
-           setTimeout(() => broadcast({ type: 'WELCOME', payload: newState }), 0);
-           return newState;
-        });
+        // Update State
+        setGameState(newState);
+        
+        // Broadcast immediately (outside of setState)
+        broadcast({ type: 'WELCOME', payload: newState });
+        return;
       }
       
       if (msg.type === 'ACTION_BUY') {
@@ -206,14 +207,14 @@ export default function App() {
          });
       }
     }
-  }, [broadcast, myPlayerId]); // Add myPlayerId to deps
+  }, [broadcast, myPlayerId]); 
 
   // --- SETUP CHANNEL ---
   const setupChannel = (code: string) => {
     if (channelRef.current) {
         channelRef.current.close();
     }
-    console.log(`Setting up channel: souls-room-${code}`);
+    // console.log(`Setting up channel: souls-room-${code}`);
     const ch = new BroadcastChannel(`souls-room-${code}`);
     ch.onmessage = (e) => handleMessage(e.data);
     channelRef.current = ch;
@@ -259,9 +260,9 @@ export default function App() {
     const code = roomInput.trim().toUpperCase();
     setupChannel(code);
     setIsHost(false);
-    setIsConnected(false); // Reset connection status
+    setIsConnected(false);
     
-    // Set local state to waiting, so UI updates
+    // Set local state to waiting
     setGameState(prev => ({
         ...prev,
         roomCode: code,
@@ -271,10 +272,8 @@ export default function App() {
     if (connectionIntervalRef.current) clearInterval(connectionIntervalRef.current);
     
     // POLL FOR ENTRY
-    // We keep sending JOIN requests until we receive a SYNC containing our ID
     const sendJoin = () => {
         if (channelRef.current) {
-            console.log("Sending JOIN request...");
             channelRef.current.postMessage({ 
                 type: 'JOIN', 
                 payload: { id: myPlayerId, name: localPlayerName } 
@@ -282,7 +281,8 @@ export default function App() {
         }
     };
     sendJoin();
-    connectionIntervalRef.current = setInterval(sendJoin, 1000);
+    // Increase frequency slightly to catch host attention
+    connectionIntervalRef.current = setInterval(sendJoin, 800);
   };
 
   const handleBuyItemRequest = (itemId: string) => {
@@ -300,7 +300,7 @@ export default function App() {
   const handleShopReady = async () => {
     if (!isHost) {
         broadcast({ type: 'ACTION_READY', payload: { playerId: myPlayerId } });
-        // Optimistic update for UI responsiveness
+        // Optimistic update
         setGameState(prev => ({
             ...prev,
             players: prev.players.map(p => p.id === myPlayerId ? { ...p, isReady: true } : p)
@@ -322,23 +322,18 @@ export default function App() {
     if (gameState.phase !== GamePhase.SHOP) return;
     if (gameState.players.length < 2) return;
     
-    // Fix: In PvE, the AI is always ready. In PvP, we wait for both.
     const allReady = gameState.players.every(p => p.isReady || p.isAi);
     
     if (allReady && !startingBattleRef.current) {
         startingBattleRef.current = true;
-        console.log("Starting Battle Phase...");
+        // console.log("Starting Battle Phase...");
         startBattlePhase().catch(err => {
             console.error("Error starting battle:", err);
             startingBattleRef.current = false;
         }).finally(() => {
-            // Once we start, we don't expect to run this effect again until next shop phase
-            // We release the lock at end of phase transition if needed, but since
-            // component state changes to BATTLE, this useEffect won't run again immediately.
             startingBattleRef.current = false;
         });
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gameState.players, gameState.phase, isHost]);
 
   const startBattlePhase = async () => {
@@ -354,10 +349,7 @@ export default function App() {
           itemsToBuyIds.forEach(id => {
               const item = SHOP_ITEMS.find(i => i.id === id);
               if (!item) return;
-
-              // Simple check for limits in AI logic (though gemini service should handle, good to double check)
               const typeCount = aiInventory.filter(aiI => aiI.type === item.type).length;
-
               if (item.cost <= aiSouls && typeCount < INVENTORY_LIMITS[item.type]) {
                   aiSouls -= item.cost;
                   aiInventory.push(item);
@@ -486,7 +478,6 @@ export default function App() {
       }, 3000);
       return () => clearTimeout(timer);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gameState.phase, isHost]);
 
   const handleNextRound = () => {
