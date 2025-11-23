@@ -8,7 +8,8 @@ import {
   Player, 
   Stats, 
   CombatLog,
-  NetworkMessage
+  NetworkMessage,
+  ItemType
 } from './types';
 import { 
   BASE_STATS, 
@@ -16,10 +17,11 @@ import {
   MAX_ROUNDS, 
   ROUND_WIN_BONUS, 
   ROUND_LOSS_BONUS, 
-  SHOP_ITEMS 
+  SHOP_ITEMS,
+  INVENTORY_LIMITS
 } from './constants';
 import { generateAiPurchases } from './services/geminiService';
-import { Sword, Shield, Skull, Crown, Users, Copy, Loader2 } from 'lucide-react';
+import { Skull, Crown, Users, Copy, Loader2 } from 'lucide-react';
 
 const createPlayer = (id: string, name: string, isAi: boolean): Player => ({
   id,
@@ -66,12 +68,11 @@ export default function App() {
   const [isHost, setIsHost] = useState(false);
   const [myPlayerId, setMyPlayerId] = useState<string>('');
   
-  // REFS for Networking (Critical for avoiding stale closures in event listeners)
+  // REFS for Networking
   const channelRef = useRef<BroadcastChannel | null>(null);
   const isHostRef = useRef(false);
-  const connectionIntervalRef = useRef<any>(null); // For retrying JOIN
+  const connectionIntervalRef = useRef<any>(null);
 
-  // Sync refs with state
   useEffect(() => { isHostRef.current = isHost; }, [isHost]);
 
   // --- NETWORKING HELPERS ---
@@ -87,6 +88,13 @@ export default function App() {
       const item = SHOP_ITEMS.find(i => i.id === itemId);
       if (!player || !item) return state;
       if (player.souls < item.cost) return state;
+
+      // CHECK LIMITS
+      const typeCount = player.inventory.filter(i => i.type === item.type).length;
+      if (typeCount >= INVENTORY_LIMITS[item.type]) {
+          console.warn(`Cannot buy ${item.name}: Limit reached for ${item.type}`);
+          return state;
+      }
 
       const newInventory = [...player.inventory, item];
       const newStats = calculateStats({ ...player, inventory: newInventory });
@@ -106,7 +114,6 @@ export default function App() {
     // --- CLIENT LOGIC ---
     if (!amIHost) {
       if (msg.type === 'WELCOME') {
-        // Connection successful!
         if (connectionIntervalRef.current) {
             clearInterval(connectionIntervalRef.current);
             connectionIntervalRef.current = null;
@@ -123,20 +130,14 @@ export default function App() {
     // --- HOST LOGIC ---
     if (amIHost) {
       if (msg.type === 'JOIN') {
-        // Deduplicate: If we already have 2 players, ignore (or check if it's a reconnect)
         setGameState(prev => {
-           // If player 2 already exists with same ID, just resend welcome (idempotent)
            const existingP2 = prev.players[1];
            if (existingP2 && existingP2.id === msg.payload.id) {
-               // Resend state to help client sync
                setTimeout(() => broadcast({ type: 'WELCOME', payload: prev }), 50);
                return prev;
            }
-           
-           // If a different player 2 is already there, ignore
            if (existingP2 && existingP2.id !== msg.payload.id) return prev;
 
-           // Add new player
            const p1 = prev.players[0];
            const p2 = createPlayer(msg.payload.id, msg.payload.name, false);
            const newState = {
@@ -145,7 +146,6 @@ export default function App() {
              phase: GamePhase.SHOP
            };
            
-           // Reply to Client
            setTimeout(() => broadcast({ type: 'WELCOME', payload: newState }), 50);
            return newState;
         });
@@ -155,7 +155,6 @@ export default function App() {
         const { playerId, itemId } = msg.payload;
         setGameState(prev => {
             const newState = processBuyItem(prev, playerId, itemId);
-            // Host must broadcast the new state after processing action
             setTimeout(() => broadcast({ type: 'SYNC', payload: newState }), 0);
             return newState;
         });
@@ -173,7 +172,6 @@ export default function App() {
     }
   }, [broadcast]);
 
-  // Keep the channel listener updated with the latest handleMessage closure
   useEffect(() => {
      if (channelRef.current) {
          channelRef.current.onmessage = (e) => handleMessage(e.data);
@@ -199,11 +197,7 @@ export default function App() {
 
   const handleCreateRoom = (mode: 'PVE' | 'PVP') => {
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-    
-    // 1. Setup Channel
     setupChannel(code);
-    
-    // 2. Set Host State
     setIsHost(true);
 
     const p1 = createPlayer(myPlayerId, localPlayerName, false);
@@ -217,7 +211,6 @@ export default function App() {
         players: [p1, p2]
       }));
     } else {
-      // PVP Host waiting
       setGameState(prev => ({
         ...prev,
         phase: GamePhase.WAITING_FOR_OPPONENT,
@@ -230,45 +223,34 @@ export default function App() {
   const handleJoinRoom = () => {
     if (!roomInput.trim()) return;
     const code = roomInput.trim().toUpperCase();
-    
-    // 1. Setup Channel
     setupChannel(code);
     setIsHost(false);
     
-    // 2. UI Feedback
     setGameState(prev => ({
         ...prev,
         roomCode: code,
         phase: GamePhase.WAITING_FOR_OPPONENT 
     }));
 
-    // 3. Start Connection Handshake (Retry until success)
     if (connectionIntervalRef.current) clearInterval(connectionIntervalRef.current);
     
     const sendJoin = () => {
         if (channelRef.current) {
-            console.log("Sending JOIN request...");
             channelRef.current.postMessage({ 
                 type: 'JOIN', 
                 payload: { id: myPlayerId, name: localPlayerName } 
             });
         }
     };
-
-    sendJoin(); // Send immediately
-    connectionIntervalRef.current = setInterval(sendJoin, 1000); // Retry every second
+    sendJoin();
+    connectionIntervalRef.current = setInterval(sendJoin, 1000);
   };
 
-  // --- LOGIC: SHOP ---
   const handleBuyItemRequest = (itemId: string) => {
-      // If Client
       if (!isHost) {
           broadcast({ type: 'ACTION_BUY', payload: { playerId: myPlayerId, itemId } });
-          // We don't update local state immediately; wait for SYNC to ensure validity
           return;
       }
-
-      // If Host
       setGameState(prev => {
           const newState = processBuyItem(prev, myPlayerId, itemId);
           broadcast({ type: 'SYNC', payload: newState });
@@ -277,7 +259,6 @@ export default function App() {
   };
 
   const handleShopReady = async () => {
-    // If Client, send Ready
     if (!isHost) {
         broadcast({ type: 'ACTION_READY', payload: { playerId: myPlayerId } });
         setGameState(prev => ({
@@ -287,7 +268,6 @@ export default function App() {
         return;
     }
 
-    // Host Logic
     setGameState(prev => {
         const updatedPlayers = prev.players.map(p => p.id === myPlayerId ? { ...p, isReady: true } : p);
         const newState = { ...prev, players: updatedPlayers };
@@ -296,7 +276,6 @@ export default function App() {
     });
   };
 
-  // Check if both ready (Effect on Host)
   useEffect(() => {
     if (!isHost) return;
     if (gameState.phase !== GamePhase.SHOP) return;
@@ -310,7 +289,6 @@ export default function App() {
   }, [gameState.players, gameState.phase, isHost]);
 
   const startBattlePhase = async () => {
-      // If AI exists, do AI purchase now
       const aiPlayer = gameState.players.find(p => p.isAi);
       const humanPlayer = gameState.players.find(p => !p.isAi);
       
@@ -322,7 +300,10 @@ export default function App() {
           const aiInventory = [...aiPlayer.inventory];
           itemsToBuyIds.forEach(id => {
               const item = SHOP_ITEMS.find(i => i.id === id);
-              if (item && item.cost <= aiSouls) {
+              // Simple check for AI limits
+              const typeCount = aiInventory.filter(aiI => aiI.type === item.type).length;
+
+              if (item && item.cost <= aiSouls && typeCount < INVENTORY_LIMITS[item.type]) {
                   aiSouls -= item.cost;
                   aiInventory.push(item);
               }
@@ -331,7 +312,6 @@ export default function App() {
           finalPlayers = finalPlayers.map(p => p.id === aiPlayer.id ? { ...p, souls: aiSouls, inventory: aiInventory, currentStats: aiStats } : p);
       }
 
-      // Reset ready state for next round and start battle
       finalPlayers = finalPlayers.map(p => ({ ...p, isReady: false }));
 
       const battleStartState = {
@@ -360,11 +340,13 @@ export default function App() {
       let baseDmg = 10;
       let scalingDmg = 0;
       let weaponName = "空手";
+      let isMagic = false;
 
       if (weapons.length > 0) {
         const weapon = weapons[Math.floor(Math.random() * weapons.length)];
         weaponName = weapon.name;
         baseDmg = 20; 
+        isMagic = weapon.type === ItemType.SPELL || weapon.name.includes("月光");
         const s = weapon.scaling || {};
         if (s.str) scalingDmg += attacker.currentStats.str * (s.str || 0);
         if (s.dex) scalingDmg += attacker.currentStats.dex * (s.dex || 0);
@@ -373,21 +355,34 @@ export default function App() {
          scalingDmg += attacker.currentStats.str * 0.5;
       }
 
-      const rawDmg = baseDmg + scalingDmg;
+      // Red Tearstone Ring Logic: +50% dmg if HP < 20%
+      const hasRTSR = attacker.inventory.some(i => i.id === 'r_rtsr');
+      const lowHp = (attacker.currentStats.hp / (100 + (attacker.inventory.reduce((a,i)=>a+(i.stats.hp||0),0)))) < 0.2;
+      let dmgMultiplier = 1;
+      if (hasRTSR && lowHp) dmgMultiplier = 1.5;
+
+      const rawDmg = (baseDmg + scalingDmg) * dmgMultiplier;
       const mitigation = defender.currentStats.def;
+      
+      // Magic penetrates defense better? Let's keep it simple: Raw - Def
       const finalDmg = Math.max(1, Math.floor(rawDmg - mitigation));
+      
       const isCrit = Math.random() < (attacker.currentStats.dex * 0.01);
       const actualDmg = isCrit ? Math.floor(finalDmg * 1.5) : finalDmg;
 
       const newDefenderHp = defender.currentStats.hp - actualDmg;
       const newDefenderStats = { ...defender.currentStats, hp: newDefenderHp };
 
+      let actionText = `使用 ${weaponName} 攻击了`;
+      if (isMagic) actionText = `施放 ${weaponName} 击中了`;
+      if (hasRTSR && lowHp) actionText += " (红泪石激活!)";
+
       const newLog: CombatLog = {
         turn: prev.logs.length + 1,
         attacker: attacker.name,
         target: defender.name,
         damage: actualDmg,
-        action: `使用 ${weaponName} 攻击了`,
+        action: actionText,
         isCrit
       };
 
@@ -413,13 +408,11 @@ export default function App() {
         };
       }
       
-      // Host syncs every turn
       broadcast({ type: 'SYNC', payload: nextState });
       return nextState;
     });
   }, [isHost, broadcast]);
 
-  // Battle Loop
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout>;
     if (isHost && gameState.phase === GamePhase.BATTLE) {
@@ -430,7 +423,6 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [gameState.phase, gameState.currentTurnIndex, executeTurn, isHost]);
 
-  // Round Result Loop
   useEffect(() => {
     if (isHost && gameState.phase === GamePhase.ROUND_RESULT && gameState.roundWinnerId) {
       const timer = setTimeout(() => {
@@ -455,7 +447,6 @@ export default function App() {
         };
       });
 
-      // Best of 3 check
       const winner = updatedPlayers.find(p => p.wins >= 2);
       let nextState;
       
@@ -507,7 +498,6 @@ export default function App() {
   };
 
   // --- RENDERS ---
-
   const renderLogin = () => (
     <div className="flex flex-col items-center justify-center h-[60vh] gap-8 animate-fade-in z-20 relative">
       <div className="text-center space-y-2">
@@ -604,36 +594,40 @@ export default function App() {
       </div>
   );
 
-  // Render logic...
   const myPlayer = gameState.players.find(p => p.id === myPlayerId) || gameState.players[0];
 
   return (
     <Layout>
-      {/* HEADER INFO */}
       {gameState.roomCode && (
           <div className="absolute top-4 right-4 z-50 bg-black/50 px-3 py-1 border border-white/10 text-xs text-souls-muted font-mono">
               ROOM: {gameState.roomCode} | {isHost ? 'HOST' : 'CLIENT'}
           </div>
       )}
 
-      {/* WINNER SCREEN */}
+      {/* GAME OVER SCREEN - Updated to Red 'YOU DIED' style */}
       {gameState.phase === GamePhase.GAME_OVER && (
-          <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/95 animate-fade-in">
-             <h1 className="text-6xl md:text-8xl font-display text-souls-gold mb-8 tracking-widest uppercase drop-shadow-[0_0_25px_rgba(255,215,0,0.5)] text-center">
+          <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black animate-fade-in">
+             {/* Blood stain effect */}
+             <div className="absolute inset-0 bg-red-900/20 mix-blend-overlay pointer-events-none"></div>
+             
+             <h1 className={`text-6xl md:text-9xl font-display mb-8 tracking-widest uppercase scale-150 drop-shadow-[0_0_30px_rgba(139,0,0,0.8)] text-center animate-you-died ${
+                gameState.gameWinnerId === myPlayerId || (isHost && gameState.gameWinnerId === gameState.players[0].id && gameState.players[0].isAi === false)
+                ? 'text-souls-gold' 
+                : 'text-souls-red'
+             }`}>
                 {gameState.gameWinnerId === myPlayerId || (isHost && gameState.gameWinnerId === gameState.players[0].id && gameState.players[0].isAi === false)
-                  ? '战胜' 
-                  : '你死了'}
+                  ? 'VICTORY ACH' 
+                  : 'YOU DIED'}
              </h1>
-             <p className="text-xl text-souls-muted font-serif italic mb-12">
+             <p className="text-2xl text-souls-muted font-serif italic mb-12 relative z-10">
                 胜利者: {gameState.players.find(p => p.id === gameState.gameWinnerId)?.name}
              </p>
-             <button onClick={resetGame} className="px-8 py-3 border border-souls-gold text-souls-gold hover:bg-souls-gold hover:text-black transition-all uppercase tracking-widest">
+             <button onClick={resetGame} className="relative z-10 px-8 py-3 border border-souls-muted text-souls-muted hover:border-white hover:text-white transition-all uppercase tracking-widest">
                 返回篝火
              </button>
           </div>
       )}
 
-      {/* ROUND OVERLAY */}
       {gameState.phase === GamePhase.ROUND_RESULT && (
           <div className="absolute inset-0 z-40 flex items-center justify-center pointer-events-none">
               <div className="bg-black/80 p-8 border-y-2 border-souls-gold w-full text-center transform transition-all animate-pulse-slow">
@@ -643,16 +637,13 @@ export default function App() {
           </div>
       )}
 
-      {/* MAIN CONTENT SWITCHER */}
       {gameState.phase === GamePhase.LOGIN ? renderLogin() :
        gameState.phase === GamePhase.LOBBY ? renderLobby() :
        gameState.phase === GamePhase.WAITING_FOR_OPPONENT ? renderWaiting() :
        null}
 
-      {/* GAME UI */}
       {(gameState.phase === GamePhase.SHOP || gameState.phase === GamePhase.BATTLE || gameState.phase === GamePhase.ROUND_RESULT) && (
         <div className="flex flex-col h-full">
-            {/* Player Status Header */}
             <div className="flex justify-between items-center mb-4 border-b border-white/10 pb-2">
                  <div className="flex gap-4">
                      {gameState.players.map(p => (
@@ -665,16 +656,13 @@ export default function App() {
                  <div className="font-display text-xl text-souls-red">回合 {gameState.round} / {gameState.maxRounds}</div>
             </div>
 
-            {/* Shop View: Only show shop if it's shop phase. If Battle, show Arena */}
             {gameState.phase === GamePhase.SHOP ? (
                 <div className="relative h-full">
-                    {/* Only render Shop controls for ME */}
                     <Shop 
                       player={myPlayer} 
                       onBuy={(itemId) => handleBuyItemRequest(itemId)}
                       onReady={handleShopReady}
                     />
-                    {/* Waiting Overlay if I am ready but waiting for opponent */}
                     {myPlayer.isReady && (
                         <div className="absolute inset-0 bg-black/60 z-10 flex items-center justify-center backdrop-blur-sm">
                              <div className="text-center animate-pulse">

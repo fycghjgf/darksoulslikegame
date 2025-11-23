@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Item, Player, ItemType } from '../types';
-import { SHOP_ITEMS } from '../constants';
+import { SHOP_ITEMS, INVENTORY_LIMITS } from '../constants';
 import { Shield, Sword, Zap, Crown, Coins } from 'lucide-react';
 
 interface ShopProps {
@@ -25,6 +25,16 @@ export const Shop: React.FC<ShopProps> = ({ player, onBuy, onReady }) => {
   );
 
   const canAfford = (cost: number) => player.souls >= cost;
+  
+  // Count items per type
+  const counts = player.inventory.reduce((acc, item) => {
+      acc[item.type] = (acc[item.type] || 0) + 1;
+      return acc;
+  }, {} as Record<ItemType, number>);
+
+  const isLimitReached = (type: ItemType) => {
+      return (counts[type] || 0) >= INVENTORY_LIMITS[type];
+  };
 
   return (
     <div className="flex flex-col h-full gap-6 animate-fade-in">
@@ -39,8 +49,8 @@ export const Shop: React.FC<ShopProps> = ({ player, onBuy, onReady }) => {
         </div>
       </div>
 
-      {/* Filters */}
-      <div className="flex gap-2 overflow-x-auto pb-2">
+      {/* Filters and Limits */}
+      <div className="flex gap-2 overflow-x-auto pb-2 items-center">
         {['ALL', ItemType.WEAPON, ItemType.ARMOR, ItemType.ACCESSORY, ItemType.SPELL].map((type) => (
           <button
             key={type}
@@ -52,6 +62,11 @@ export const Shop: React.FC<ShopProps> = ({ player, onBuy, onReady }) => {
             }`}
           >
             {TYPE_LABELS[type] || type}
+            {type !== 'ALL' && (
+                <span className="ml-2 text-xs opacity-60">
+                    ({counts[type as ItemType] || 0}/{INVENTORY_LIMITS[type as ItemType]})
+                </span>
+            )}
           </button>
         ))}
       </div>
@@ -60,14 +75,17 @@ export const Shop: React.FC<ShopProps> = ({ player, onBuy, onReady }) => {
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 overflow-y-auto flex-grow max-h-[60vh] pr-2 custom-scrollbar">
         {filteredItems.map((item) => {
           const isOwned = player.inventory.some((i) => i.id === item.id);
-          
+          const limitReached = isLimitReached(item.type);
+          const afford = canAfford(item.cost);
+          const disableBuy = afford === false || (limitReached && !isOwned);
+
           return (
             <div
               key={item.id}
               className={`group relative border p-4 transition-all duration-300 flex flex-col justify-between gap-4 ${
-                canAfford(item.cost)
+                !disableBuy
                   ? 'border-souls-gray bg-souls-dark/40 hover:border-souls-text hover:bg-souls-gray/20'
-                  : 'border-red-900/30 bg-red-900/5 opacity-60 grayscale'
+                  : 'border-white/5 bg-black/20 opacity-50'
               }`}
             >
               <div>
@@ -91,6 +109,7 @@ export const Shop: React.FC<ShopProps> = ({ player, onBuy, onReady }) => {
                   {item.stats.int && <span>智力: +{item.stats.int}</span>}
                   {item.stats.def && <span>防御: +{item.stats.def}</span>}
                   {item.stats.hp && <span>生命: +{item.stats.hp}</span>}
+                  {item.stats.poise && <span>强韧: +{item.stats.poise}</span>}
                   
                   {item.scaling && (
                      <div className="col-span-2 mt-1 pt-1 border-t border-white/10 flex gap-2">
@@ -105,14 +124,21 @@ export const Shop: React.FC<ShopProps> = ({ player, onBuy, onReady }) => {
 
               <button
                 onClick={() => onBuy(item.id)}
-                disabled={!canAfford(item.cost)}
+                disabled={disableBuy || isOwned}
                 className={`w-full py-2 border text-sm uppercase tracking-widest font-bold transition-all ${
-                  canAfford(item.cost)
-                    ? 'border-souls-gold text-souls-gold hover:bg-souls-gold hover:text-black'
-                    : 'border-red-900 text-red-900 cursor-not-allowed'
+                  disableBuy
+                    ? 'border-transparent text-gray-600 cursor-not-allowed'
+                    : 'border-souls-gold text-souls-gold hover:bg-souls-gold hover:text-black'
                 }`}
               >
-                {isOwned ? '购买 (持有)' : '购买'} ({item.cost})
+                {isOwned 
+                    ? '已拥有' 
+                    : limitReached 
+                        ? '槽位已满' 
+                        : !afford 
+                            ? '灵魂不足' 
+                            : `购买 (${item.cost})`
+                }
               </button>
             </div>
           );
