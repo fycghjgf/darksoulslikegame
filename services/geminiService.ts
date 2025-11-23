@@ -2,19 +2,19 @@ import { GoogleGenAI, Type } from "@google/genai";
 import { Item, Player, Stats } from "../types";
 import { SHOP_ITEMS } from "../constants";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-
 export const generateAiPurchases = async (
   aiPlayer: Player,
   humanPlayer: Player,
   round: number
 ): Promise<string[]> => {
   try {
-    // If API key is missing, fallback to basic logic
-    if (!process.env.API_KEY) {
+    // Lazy initialization to be safe if process.env is not defined at module load time
+    const apiKey = process.env.API_KEY;
+    if (!apiKey) {
       console.warn("Gemini API Key not found, using fallback AI.");
       return basicFallbackAi(aiPlayer);
     }
+    const ai = new GoogleGenAI({ apiKey });
 
     const shopContext = SHOP_ITEMS.map(i => `${i.id}: ${i.name} (${i.cost} 魂) - ${i.type} - ${i.description}`).join('\n');
     const opponentContext = `对手 (人类) 属性: HP:${humanPlayer.currentStats.hp}, 力量:${humanPlayer.currentStats.str}, 敏捷:${humanPlayer.currentStats.dex}, 智力:${humanPlayer.currentStats.int}, 防御:${humanPlayer.currentStats.def}. 物品: ${humanPlayer.inventory.map(i => i.name).join(', ')}`;

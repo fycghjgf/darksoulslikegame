@@ -225,7 +225,7 @@ export default function App() {
 
   // Battle Loop Timer
   useEffect(() => {
-    let timer: ReturnType<typeof setTimeout>;
+    let timer: any; // Using any to avoid NodeJS.Timeout vs number conflicts across environments
     if (gameState.phase === GamePhase.BATTLE) {
       timer = setTimeout(() => {
         executeTurn();
