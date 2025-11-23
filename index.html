@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>魂之竞技场</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;700;900&family=Lora:ital,wght@0,400;0,700;1,400&family=Noto+Serif+SC:wght@400;700&display=swap" rel="stylesheet">
+    <script>
+      tailwind.config = {
+        darkMode: 'class',
+        theme: {
+          extend: {
+            fontFamily: {
+              serif: ['"Noto Serif SC"', 'Lora', 'serif'],
+              display: ['Cinzel', '"Noto Serif SC"', 'serif'],
+            },
+            colors: {
+              souls: {
+                black: '#0a0a0a',
+                dark: '#1a1a1a',
+                gray: '#2a2a2a',
+                gold: '#ffd700',
+                red: '#8b0000',
+                blue: '#1e90ff',
+                text: '#e5e5e5',
+                muted: '#a3a3a3'
+              }
+            },
+            animation: {
+              'fade-in': 'fadeIn 0.5s ease-out',
+              'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+              'shake': 'shake 0.5s cubic-bezier(.36,.07,.19,.97) both',
+              'attack-right': 'attackRight 0.4s ease-in-out',
+              'attack-left': 'attackLeft 0.4s ease-in-out',
+              'hit': 'hit 0.4s ease-in-out',
+              'die': 'die 1s forwards'
+            },
+            keyframes: {
+              fadeIn: {
+                '0%': { opacity: '0', transform: 'translateY(10px)' },
+                '100%': { opacity: '1', transform: 'translateY(0)' },
+              },
+              shake: {
+                '10%, 90%': { transform: 'translate3d(-1px, 0, 0)' },
+                '20%, 80%': { transform: 'translate3d(2px, 0, 0)' },
+                '30%, 50%, 70%': { transform: 'translate3d(-4px, 0, 0)' },
+                '40%, 60%': { transform: 'translate3d(4px, 0, 0)' }
+              },
+              attackRight: {
+                '0%': { transform: 'translateX(0)' },
+                '50%': { transform: 'translateX(40px)' },
+                '100%': { transform: 'translateX(0)' }
+              },
+              attackLeft: {
+                '0%': { transform: 'translateX(0)' },
+                '50%': { transform: 'translateX(-40px)' },
+                '100%': { transform: 'translateX(0)' }
+              },
+              hit: {
+                '0%, 100%': { filter: 'brightness(1)' },
+                '50%': { filter: 'brightness(2) sepia(1) hue-rotate(-50deg) saturate(5)' }
+              },
+              die: {
+                '0%': { opacity: '1', transform: 'translateY(0)' },
+                '100%': { opacity: '0', transform: 'translateY(20px)' }
+              }
+            }
+          }
+        }
+      }
+    </script>
+    <style>
+      body {
+        background-color: #050505;
+        color: #e5e5e5;
+        font-family: 'Noto Serif SC', 'Lora', serif;
+      }
+      .scanlines {
+        background: linear-gradient(
+          to bottom,
+          rgba(255,255,255,0),
+          rgba(255,255,255,0) 50%,
+          rgba(0,0,0,0.2) 50%,
+          rgba(0,0,0,0.2)
+        );
+        background-size: 100% 4px;
+        position: fixed;
+        pointer-events: none;
+        top: 0; left: 0; right: 0; bottom: 0;
+        z-index: 50;
+      }
+      .vignette {
+        position: fixed;
+        top: 0; left: 0; width: 100%; height: 100%;
+        box-shadow: 0 0 150px rgba(0,0,0,0.9) inset;
+        pointer-events: none;
+        z-index: 40;
+      }
+      .custom-scrollbar::-webkit-scrollbar {
+        width: 8px;
+      }
+      .custom-scrollbar::-webkit-scrollbar-track {
+        background: #1a1a1a; 
+      }
+      .custom-scrollbar::-webkit-scrollbar-thumb {
+        background: #444; 
+      }
+      .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+        background: #666; 
+      }
+    </style>
+  <script type="importmap">
+{
+  "imports": {
+    "lucide-react": "https://aistudiocdn.com/lucide-react@^0.554.0",
+    "react/": "https://aistudiocdn.com/react@^19.2.0/",
+    "react": "https://aistudiocdn.com/react@^19.2.0",
+    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.30.0",
+    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/"
+  }
+}
+</script>
+</head>
+  <body>
+    <div id="root"></div>
+    <div class="scanlines"></div>
+    <div class="vignette"></div>
+  </body>
+</html>
