@@ -65,7 +65,14 @@ export default function App() {
   // Networking State
   const [isHost, setIsHost] = useState(false);
   const [myPlayerId, setMyPlayerId] = useState<string>('');
+  
+  // REFS for Networking (Critical for avoiding stale closures in event listeners)
   const channelRef = useRef<BroadcastChannel | null>(null);
+  const isHostRef = useRef(false);
+  const connectionIntervalRef = useRef<any>(null); // For retrying JOIN
+
+  // Sync refs with state
+  useEffect(() => { isHostRef.current = isHost; }, [isHost]);
 
   // --- NETWORKING HELPERS ---
   const broadcast = useCallback((msg: NetworkMessage) => {
@@ -74,37 +81,84 @@ export default function App() {
     }
   }, []);
 
+  // Helper to process a buy action (state update only)
+  const processBuyItem = (state: GameState, playerId: string, itemId: string): GameState => {
+      const player = state.players.find(p => p.id === playerId);
+      const item = SHOP_ITEMS.find(i => i.id === itemId);
+      if (!player || !item) return state;
+      if (player.souls < item.cost) return state;
+
+      const newInventory = [...player.inventory, item];
+      const newStats = calculateStats({ ...player, inventory: newInventory });
+      
+      const updatedPlayers = state.players.map(p => 
+          p.id === playerId 
+          ? { ...p, souls: p.souls - item.cost, inventory: newInventory, currentStats: newStats }
+          : p
+      );
+      return { ...state, players: updatedPlayers };
+  };
+
   // Handle incoming messages
   const handleMessage = useCallback((msg: NetworkMessage) => {
-    if (!isHost) {
-      // CLIENT LOGIC
-      if (msg.type === 'WELCOME' || msg.type === 'SYNC') {
+    const amIHost = isHostRef.current;
+
+    // --- CLIENT LOGIC ---
+    if (!amIHost) {
+      if (msg.type === 'WELCOME') {
+        // Connection successful!
+        if (connectionIntervalRef.current) {
+            clearInterval(connectionIntervalRef.current);
+            connectionIntervalRef.current = null;
+        }
         setGameState(msg.payload);
       }
-    } else {
-      // HOST LOGIC
+      
+      if (msg.type === 'SYNC') {
+        setGameState(msg.payload);
+      }
+      return;
+    } 
+
+    // --- HOST LOGIC ---
+    if (amIHost) {
       if (msg.type === 'JOIN') {
-        // A challenger approaches!
-        const p2Name = msg.payload.name;
-        const p2Id = msg.payload.id;
-        
+        // Deduplicate: If we already have 2 players, ignore (or check if it's a reconnect)
         setGameState(prev => {
-          const p1 = prev.players[0];
-          const p2 = createPlayer(p2Id, p2Name, false);
-          const newState = {
-            ...prev,
-            players: [p1, p2],
-            phase: GamePhase.SHOP
-          };
-          // Send initial state to client
-          setTimeout(() => broadcast({ type: 'WELCOME', payload: newState }), 100);
-          return newState;
+           // If player 2 already exists with same ID, just resend welcome (idempotent)
+           const existingP2 = prev.players[1];
+           if (existingP2 && existingP2.id === msg.payload.id) {
+               // Resend state to help client sync
+               setTimeout(() => broadcast({ type: 'WELCOME', payload: prev }), 50);
+               return prev;
+           }
+           
+           // If a different player 2 is already there, ignore
+           if (existingP2 && existingP2.id !== msg.payload.id) return prev;
+
+           // Add new player
+           const p1 = prev.players[0];
+           const p2 = createPlayer(msg.payload.id, msg.payload.name, false);
+           const newState = {
+             ...prev,
+             players: [p1, p2],
+             phase: GamePhase.SHOP
+           };
+           
+           // Reply to Client
+           setTimeout(() => broadcast({ type: 'WELCOME', payload: newState }), 50);
+           return newState;
         });
       }
       
       if (msg.type === 'ACTION_BUY') {
         const { playerId, itemId } = msg.payload;
-        handleBuyItem(playerId, itemId); // Host processes the buy
+        setGameState(prev => {
+            const newState = processBuyItem(prev, playerId, itemId);
+            // Host must broadcast the new state after processing action
+            setTimeout(() => broadcast({ type: 'SYNC', payload: newState }), 0);
+            return newState;
+        });
       }
 
       if (msg.type === 'ACTION_READY') {
@@ -112,20 +166,19 @@ export default function App() {
          setGameState(prev => {
              const updatedPlayers = prev.players.map(p => p.id === playerId ? { ...p, isReady: true } : p);
              const newState = { ...prev, players: updatedPlayers };
-             // Broadcast immediately so client sees ready status
              broadcast({ type: 'SYNC', payload: newState });
              return newState;
          });
       }
     }
-  }, [isHost, broadcast]);
+  }, [broadcast]);
 
-  // Sync state whenever it changes (Host only)
+  // Keep the channel listener updated with the latest handleMessage closure
   useEffect(() => {
-    if (isHost && gameState.players.length > 1) {
-      broadcast({ type: 'SYNC', payload: gameState });
-    }
-  }, [gameState, isHost, broadcast]);
+     if (channelRef.current) {
+         channelRef.current.onmessage = (e) => handleMessage(e.data);
+     }
+  }, [handleMessage]);
 
 
   // --- GAME ACTIONS ---
@@ -146,7 +199,11 @@ export default function App() {
 
   const handleCreateRoom = (mode: 'PVE' | 'PVP') => {
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+    
+    // 1. Setup Channel
     setupChannel(code);
+    
+    // 2. Set Host State
     setIsHost(true);
 
     const p1 = createPlayer(myPlayerId, localPlayerName, false);
@@ -165,7 +222,7 @@ export default function App() {
         ...prev,
         phase: GamePhase.WAITING_FOR_OPPONENT,
         roomCode: code,
-        players: [p1] // Only me for now
+        players: [p1] 
       }));
     }
   };
@@ -173,63 +230,56 @@ export default function App() {
   const handleJoinRoom = () => {
     if (!roomInput.trim()) return;
     const code = roomInput.trim().toUpperCase();
+    
+    // 1. Setup Channel
     setupChannel(code);
     setIsHost(false);
     
-    // Send Join Request
-    // We delay slightly to ensure channel is ready
-    setTimeout(() => {
+    // 2. UI Feedback
+    setGameState(prev => ({
+        ...prev,
+        roomCode: code,
+        phase: GamePhase.WAITING_FOR_OPPONENT 
+    }));
+
+    // 3. Start Connection Handshake (Retry until success)
+    if (connectionIntervalRef.current) clearInterval(connectionIntervalRef.current);
+    
+    const sendJoin = () => {
         if (channelRef.current) {
+            console.log("Sending JOIN request...");
             channelRef.current.postMessage({ 
                 type: 'JOIN', 
                 payload: { id: myPlayerId, name: localPlayerName } 
             });
         }
-    }, 100);
+    };
 
-    // Optimistically update UI
-    setGameState(prev => ({
-        ...prev,
-        roomCode: code,
-        phase: GamePhase.WAITING_FOR_OPPONENT // Waiting for WELCOME
-    }));
+    sendJoin(); // Send immediately
+    connectionIntervalRef.current = setInterval(sendJoin, 1000); // Retry every second
   };
 
   // --- LOGIC: SHOP ---
-  const handleBuyItem = (playerId: string, itemId: string) => {
-    // If Client tries to buy, send request to Host
-    if (!isHost && playerId === myPlayerId) {
-        broadcast({ type: 'ACTION_BUY', payload: { playerId, itemId } });
-        return;
-    }
-    
-    // Host Logic (or AI processing)
-    if (isHost) {
-        setGameState(prev => {
-            const player = prev.players.find(p => p.id === playerId);
-            const item = SHOP_ITEMS.find(i => i.id === itemId);
-            if (!player || !item) return prev;
-            if (player.souls < item.cost) return prev;
+  const handleBuyItemRequest = (itemId: string) => {
+      // If Client
+      if (!isHost) {
+          broadcast({ type: 'ACTION_BUY', payload: { playerId: myPlayerId, itemId } });
+          // We don't update local state immediately; wait for SYNC to ensure validity
+          return;
+      }
 
-            const newInventory = [...player.inventory, item];
-            const newStats = calculateStats({ ...player, inventory: newInventory });
-            
-            const updatedPlayers = prev.players.map(p => 
-                p.id === playerId 
-                ? { ...p, souls: p.souls - item.cost, inventory: newInventory, currentStats: newStats }
-                : p
-            );
-            
-            return { ...prev, players: updatedPlayers };
-        });
-    }
+      // If Host
+      setGameState(prev => {
+          const newState = processBuyItem(prev, myPlayerId, itemId);
+          broadcast({ type: 'SYNC', payload: newState });
+          return newState;
+      });
   };
 
   const handleShopReady = async () => {
     // If Client, send Ready
     if (!isHost) {
         broadcast({ type: 'ACTION_READY', payload: { playerId: myPlayerId } });
-        // Optimistic update
         setGameState(prev => ({
             ...prev,
             players: prev.players.map(p => p.id === myPlayerId ? { ...p, isReady: true } : p)
@@ -239,9 +289,10 @@ export default function App() {
 
     // Host Logic
     setGameState(prev => {
-        // Mark Host as ready
         const updatedPlayers = prev.players.map(p => p.id === myPlayerId ? { ...p, isReady: true } : p);
-        return { ...prev, players: updatedPlayers };
+        const newState = { ...prev, players: updatedPlayers };
+        broadcast({ type: 'SYNC', payload: newState });
+        return newState;
     });
   };
 
@@ -283,17 +334,20 @@ export default function App() {
       // Reset ready state for next round and start battle
       finalPlayers = finalPlayers.map(p => ({ ...p, isReady: false }));
 
-      setGameState(prev => ({
-          ...prev,
+      const battleStartState = {
+          ...gameState,
           players: finalPlayers,
           phase: GamePhase.BATTLE,
           logs: []
-      }));
+      };
+
+      setGameState(battleStartState);
+      broadcast({ type: 'SYNC', payload: battleStartState });
   };
 
   // --- LOGIC: BATTLE ---
   const executeTurn = useCallback(() => {
-    if (!isHost) return; // Only host calculates turns
+    if (!isHost) return; 
 
     setGameState(prev => {
       const attackerIdx = prev.currentTurnIndex;
@@ -340,24 +394,30 @@ export default function App() {
       const updatedPlayers = [...prev.players];
       updatedPlayers[defenderIdx] = { ...defender, currentStats: newDefenderStats };
 
+      let nextState = { ...prev };
+
       if (newDefenderHp <= 0) {
-        return {
+        nextState = {
           ...prev,
           players: updatedPlayers,
           logs: [...prev.logs, newLog, { turn: prev.logs.length + 2, attacker: 'SYSTEM', target: '', damage: 0, action: `${defender.name} 死亡。`, isCrit: false }],
           roundWinnerId: attacker.id,
           phase: GamePhase.ROUND_RESULT
         };
+      } else {
+        nextState = {
+          ...prev,
+          players: updatedPlayers,
+          logs: [...prev.logs, newLog],
+          currentTurnIndex: defenderIdx
+        };
       }
-
-      return {
-        ...prev,
-        players: updatedPlayers,
-        logs: [...prev.logs, newLog],
-        currentTurnIndex: defenderIdx
-      };
+      
+      // Host syncs every turn
+      broadcast({ type: 'SYNC', payload: nextState });
+      return nextState;
     });
-  }, [isHost]);
+  }, [isHost, broadcast]);
 
   // Battle Loop
   useEffect(() => {
@@ -397,6 +457,8 @@ export default function App() {
 
       // Best of 3 check
       const winner = updatedPlayers.find(p => p.wins >= 2);
+      let nextState;
+      
       if (winner || prev.round >= MAX_ROUNDS) {
         const p1Wins = updatedPlayers[0].wins;
         const p2Wins = updatedPlayers[1].wins;
@@ -404,27 +466,32 @@ export default function App() {
         if (!finalWinnerId) {
              finalWinnerId = p1Wins >= p2Wins ? updatedPlayers[0].id : updatedPlayers[1].id;
         }
-        return {
+        nextState = {
             ...prev,
             players: updatedPlayers,
             phase: GamePhase.GAME_OVER,
             gameWinnerId: finalWinnerId
         };
+      } else {
+        nextState = {
+            ...prev,
+            players: updatedPlayers,
+            round: prev.round + 1,
+            roundWinnerId: null,
+            logs: [],
+            phase: GamePhase.SHOP
+        };
       }
-
-      return {
-        ...prev,
-        players: updatedPlayers,
-        round: prev.round + 1,
-        roundWinnerId: null,
-        logs: [],
-        phase: GamePhase.SHOP
-      };
+      
+      broadcast({ type: 'SYNC', payload: nextState });
+      return nextState;
     });
   };
 
   const resetGame = () => {
     if (channelRef.current) channelRef.current.close();
+    if (connectionIntervalRef.current) clearInterval(connectionIntervalRef.current);
+    
     setGameState({
       phase: GamePhase.LOBBY,
       round: 1,
@@ -530,7 +597,7 @@ export default function App() {
              <>
                 <Loader2 className="w-16 h-16 text-souls-text animate-spin" />
                 <h2 className="text-2xl font-display text-white">正在入侵世界 {gameState.roomCode}...</h2>
-                <p className="text-souls-muted">连接中...</p>
+                <p className="text-souls-muted">连接中... (如果长时间未响应，请检查代码)</p>
              </>
           )}
           <button onClick={resetGame} className="mt-8 text-sm text-red-500 hover:underline">取消</button>
@@ -604,7 +671,7 @@ export default function App() {
                     {/* Only render Shop controls for ME */}
                     <Shop 
                       player={myPlayer} 
-                      onBuy={(itemId) => handleBuyItem(myPlayer.id, itemId)}
+                      onBuy={(itemId) => handleBuyItemRequest(itemId)}
                       onReady={handleShopReady}
                     />
                     {/* Waiting Overlay if I am ready but waiting for opponent */}
