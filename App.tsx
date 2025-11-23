@@ -21,14 +21,10 @@ import {
   INVENTORY_LIMITS
 } from './constants';
 import { generateAiPurchases } from './services/geminiService';
-import { Skull, Crown, Users, Copy, Loader2, RefreshCw, Wifi, WifiOff } from 'lucide-react';
+import { Skull, Crown, Users, Copy, Loader2, RefreshCw, Server, WifiOff } from 'lucide-react';
 
-// Declare PeerJS global
-declare global {
-  interface Window {
-    Peer: any;
-  }
-}
+// Declare MQTT global from script tag
+declare const mqtt: any;
 
 const createPlayer = (id: string, name: string, isAi: boolean): Player => ({
   id,
@@ -54,8 +50,9 @@ const calculateStats = (player: Player): Stats => {
   return stats;
 };
 
-// PeerJS ID Prefix to avoid random collision on public server
-const APP_ID_PREFIX = 'souls-arena-game-v1-';
+// Use a public MQTT Broker via WebSockets
+const MQTT_BROKER_URL = 'wss://broker.emqx.io:8084/mqtt';
+const TOPIC_PREFIX = 'souls-arena-game/v2/';
 
 export default function App() {
   // --- STATE ---
@@ -78,11 +75,10 @@ export default function App() {
   const [isHost, setIsHost] = useState(false);
   const [myPlayerId, setMyPlayerId] = useState<string>('');
   const [isConnected, setIsConnected] = useState(false);
-  const [peerStatus, setPeerStatus] = useState<string>('离线');
+  const [netStatus, setNetStatus] = useState<string>('离线');
   
   // REFS for Networking and Logic
-  const peerRef = useRef<any>(null);
-  const connRef = useRef<any>(null); // The active P2P connection
+  const mqttClientRef = useRef<any>(null);
   const isHostRef = useRef(false);
   const gameStateRef = useRef(gameState);
   const startingBattleRef = useRef(false);
@@ -91,43 +87,51 @@ export default function App() {
   useEffect(() => { isHostRef.current = isHost; }, [isHost]);
   useEffect(() => { gameStateRef.current = gameState; }, [gameState]);
 
-  // --- PEERJS HELPERS ---
+  // --- MQTT HELPERS ---
 
-  // Helper to send message to the OTHER player
+  // Topics:
+  // Host Listens: TOPIC_PREFIX + code + '/server' (INCOMING ACTIONS)
+  // Host Publishes: TOPIC_PREFIX + code + '/client' (GAME STATE)
+  // Client Listens: TOPIC_PREFIX + code + '/client'
+  // Client Publishes: TOPIC_PREFIX + code + '/server'
+
+  const getMyPublishTopic = (code: string) => {
+      return isHostRef.current 
+        ? `${TOPIC_PREFIX}${code}/client` 
+        : `${TOPIC_PREFIX}${code}/server`;
+  };
+
   const send = useCallback((msg: NetworkMessage) => {
-    if (connRef.current && connRef.current.open) {
+    if (mqttClientRef.current && mqttClientRef.current.connected && gameStateRef.current.roomCode) {
       try {
-        connRef.current.send(msg);
+        const topic = getMyPublishTopic(gameStateRef.current.roomCode);
+        mqttClientRef.current.publish(topic, JSON.stringify(msg));
       } catch (e) {
-        console.error("P2P Send failed", e);
+        console.error("MQTT Send failed", e);
       }
     }
   }, []);
 
-  // Handle incoming messages (Identical logic to before, just triggered by WebRTC data)
   const handleMessage = useCallback((msg: NetworkMessage) => {
     const amIHost = isHostRef.current;
     
-    // console.log("Received:", msg.type, amIHost ? "(Host)" : "(Client)");
-
-    // --- CLIENT LOGIC ---
+    // --- CLIENT LOGIC (Receiving State) ---
     if (!amIHost) {
       if (msg.type === 'SYNC' || msg.type === 'WELCOME') {
         const serverState = msg.payload as GameState;
-        
-        // Optimistic connection check: if we got state, we are synced
-        if (!isConnected) setIsConnected(true);
-        
+        if (!isConnected) {
+            setIsConnected(true);
+            setNetStatus("已连接服务器");
+        }
         setGameState(serverState);
       }
       return;
     } 
 
-    // --- HOST LOGIC ---
+    // --- HOST LOGIC (Receiving Actions) ---
     if (amIHost) {
       if (msg.type === 'JOIN') {
         const { id, name } = msg.payload;
-        
         const currentState = gameStateRef.current;
         const existingPlayer = currentState.players.find(p => p.id === id);
         
@@ -136,9 +140,7 @@ export default function App() {
             return;
         }
 
-        if (currentState.players.length >= 2) {
-            return;
-        }
+        if (currentState.players.length >= 2) return;
 
         // Add new player
         const p2 = createPlayer(id, name, false);
@@ -149,9 +151,8 @@ export default function App() {
         };
 
         setGameState(newState);
-        // Force send immediately to the specific connection that just joined
-        // Note: In 1v1 peerjs, connRef points to the single peer.
-        setTimeout(() => send({ type: 'WELCOME', payload: newState }), 100);
+        // Important: Wait a tick for React state to potentially settle, then broadcast
+        setTimeout(() => send({ type: 'WELCOME', payload: newState }), 50);
         return;
       }
       
@@ -176,112 +177,72 @@ export default function App() {
     }
   }, [send, isConnected]); 
 
-  // --- INITIALIZE PEER (HOST) ---
-  const initHostPeer = (code: string) => {
-    if (peerRef.current) peerRef.current.destroy();
+  // --- INITIALIZE MQTT ---
+  const connectMqtt = (code: string, isHostRole: boolean) => {
+      if (mqttClientRef.current) {
+          mqttClientRef.current.end();
+      }
 
-    const peerId = `${APP_ID_PREFIX}${code}`;
-    const peer = new window.Peer(peerId, { debug: 1 });
+      setNetStatus('正在连接中继服务器...');
+      
+      const clientId = `souls-${Math.random().toString(16).substr(2, 8)}`;
+      const client = mqtt.connect(MQTT_BROKER_URL, {
+          clientId,
+          clean: true,
+          connectTimeout: 4000,
+      });
 
-    setPeerStatus('正在建立房间...');
+      client.on('connect', () => {
+          // console.log('MQTT Connected');
+          setNetStatus(isHostRole ? '房间已创建 (在线)' : '已连接中继，正在同步...');
+          
+          if (isHostRole) {
+              setIsConnected(true);
+              // Host subscribes to incoming actions from clients
+              client.subscribe(`${TOPIC_PREFIX}${code}/server`);
+          } else {
+              // Client subscribes to game state updates
+              client.subscribe(`${TOPIC_PREFIX}${code}/client`);
+              // Send JOIN immediately once connected
+              setTimeout(() => {
+                 client.publish(`${TOPIC_PREFIX}${code}/server`, JSON.stringify({ 
+                     type: 'JOIN', 
+                     payload: { id: myPlayerId, name: localPlayerName } 
+                 }));
+              }, 500);
+          }
+      });
 
-    peer.on('open', (id: string) => {
-        // console.log('Host Peer Opened:', id);
-        setPeerStatus('房间已建立，等待连接...');
-        setIsConnected(true); // Host is "connected" to the signaling server
-    });
+      client.on('message', (topic: string, message: any) => {
+          try {
+              const msgData = JSON.parse(message.toString()) as NetworkMessage;
+              handleMessage(msgData);
+          } catch (e) {
+              console.error("Failed to parse message", e);
+          }
+      });
 
-    peer.on('connection', (conn: any) => {
-        // console.log('Host received connection!');
-        
-        // Clean up old connection if exists (1v1 only)
-        if (connRef.current) connRef.current.close();
-        
-        connRef.current = conn;
-        setPeerStatus('挑战者已连接!');
+      client.on('error', (err: any) => {
+          console.error('MQTT Error:', err);
+          setNetStatus('连接错误');
+      });
+      
+      client.on('reconnect', () => {
+          setNetStatus('正在重连...');
+      });
 
-        conn.on('data', (data: any) => handleMessage(data));
-        
-        conn.on('open', () => {
-             // Send current state immediately upon open
-             conn.send({ type: 'WELCOME', payload: gameStateRef.current });
-        });
-        
-        conn.on('close', () => {
-             setPeerStatus('挑战者已断开');
-             connRef.current = null;
-        });
-    });
-
-    peer.on('error', (err: any) => {
-        console.error('Peer Error:', err);
-        setPeerStatus(`网络错误: ${err.type}`);
-        if (err.type === 'unavailable-id') {
-            alert("房间代码已被占用，请重试或更换代码");
-        }
-    });
-
-    peerRef.current = peer;
+      mqttClientRef.current = client;
   };
 
-  // --- INITIALIZE PEER (CLIENT) ---
-  const initClientPeer = (code: string) => {
-     if (peerRef.current) peerRef.current.destroy();
-
-     // Client gets random ID
-     const peer = new window.Peer(null, { debug: 1 });
-     setPeerStatus('正在连接服务器...');
-
-     peer.on('open', (id: string) => {
-         // console.log('Client Peer Opened:', id);
-         setPeerStatus('正在寻找房间...');
-         
-         const hostId = `${APP_ID_PREFIX}${code}`;
-         const conn = peer.connect(hostId, { reliable: true });
-
-         conn.on('open', () => {
-             setPeerStatus('已连接到房间!');
-             setIsConnected(true);
-             connRef.current = conn;
-             
-             // Send handshake
-             conn.send({ 
-                 type: 'JOIN', 
-                 payload: { id: myPlayerId, name: localPlayerName } 
-             });
-         });
-
-         conn.on('data', (data: any) => handleMessage(data));
-         
-         conn.on('close', () => {
-             setPeerStatus('与房主断开连接');
-             setIsConnected(false);
-             connRef.current = null;
-         });
-         
-         conn.on('error', (err: any) => {
-             console.error("Conn Error", err);
-             setPeerStatus("连接失败");
-         });
-     });
-
-     peer.on('error', (err: any) => {
-         console.error('Peer Error:', err);
-         setPeerStatus(`连接失败: ${err.type}`);
-     });
-
-     peerRef.current = peer;
-  };
-
-  // HOST HEARTBEAT: Broadcast state every 2s to ensure sync
+  // HOST HEARTBEAT: Broadcast state every 1.5s via MQTT
   useEffect(() => {
     if (!isHost || !gameState.roomCode) return;
     
     const interval = setInterval(() => {
-        if (gameStateRef.current.phase !== GamePhase.LOGIN && connRef.current && connRef.current.open) {
+        if (gameStateRef.current.phase !== GamePhase.LOGIN && mqttClientRef.current?.connected) {
             send({ type: 'SYNC', payload: gameStateRef.current });
         }
-    }, 2000);
+    }, 1500);
 
     return () => clearInterval(interval);
   }, [isHost, send]); 
@@ -319,8 +280,6 @@ export default function App() {
   };
 
   const handleCreateRoom = (mode: 'PVE' | 'PVP') => {
-    // Generate a simple numeric code for easier typing on mobile, but append a random string internally for security if needed
-    // For this demo, let's use a 4 digit code to keep it simple
     const code = Math.floor(1000 + Math.random() * 9000).toString();
     
     setGameState(prev => ({
@@ -338,9 +297,8 @@ export default function App() {
         phase: GamePhase.SHOP,
         players: [p1, p2]
       }));
-      // No networking needed for PvE really, but we leave it initialized in case
     } else {
-      initHostPeer(code);
+      connectMqtt(code, true);
       setGameState(prev => ({
         ...prev,
         phase: GamePhase.WAITING_FOR_OPPONENT,
@@ -362,7 +320,7 @@ export default function App() {
         phase: GamePhase.WAITING_FOR_OPPONENT 
     }));
 
-    initClientPeer(code);
+    connectMqtt(code, false);
   };
 
   const handleBuyItemRequest = (itemId: string) => {
@@ -605,7 +563,7 @@ export default function App() {
   };
 
   const resetGame = () => {
-    if (peerRef.current) peerRef.current.destroy();
+    if (mqttClientRef.current) mqttClientRef.current.end();
     
     setGameState({
       phase: GamePhase.LOBBY,
@@ -620,7 +578,7 @@ export default function App() {
     });
     setIsHost(false);
     setIsConnected(false);
-    setPeerStatus('离线');
+    setNetStatus('离线');
   };
 
   // --- RENDERS ---
@@ -701,7 +659,9 @@ export default function App() {
                 <div className="text-center">
                     <h2 className="text-2xl font-display text-white mb-2">等待挑战者...</h2>
                     <p className="text-souls-muted mb-2">分享此代码给你的对手 (不同设备可用)</p>
-                    <p className="text-xs text-blue-400 mb-6 font-mono">{peerStatus}</p>
+                    <p className="text-xs text-blue-400 mb-6 font-mono flex items-center justify-center gap-2">
+                        <Server size={12}/> {netStatus}
+                    </p>
 
                     <div className="flex items-center gap-4 bg-souls-gray/30 p-4 rounded border border-souls-gold/30">
                         <span className="text-4xl font-mono font-bold text-souls-gold tracking-[0.5em]">{gameState.roomCode}</span>
@@ -718,14 +678,14 @@ export default function App() {
                         <Users className="w-16 h-16 text-green-500" />
                         <h2 className="text-2xl font-display text-white">已连接!</h2>
                         <p className="text-souls-muted">等待房主开始...</p>
-                        <p className="text-xs text-blue-400 font-mono">{peerStatus}</p>
+                        <p className="text-xs text-blue-400 font-mono">{netStatus}</p>
                     </div>
                 ) : (
                     <div className="flex flex-col items-center gap-4">
                         <RefreshCw className="w-16 h-16 text-souls-red animate-spin" />
                         <h2 className="text-2xl font-display text-white">正在入侵世界 {gameState.roomCode}...</h2>
-                        <p className="text-souls-muted">正在搜寻灵体频率 (PeerP2P)...</p>
-                        <p className="text-xs text-blue-400 font-mono">{peerStatus}</p>
+                        <p className="text-souls-muted">正在连接中继服务器...</p>
+                        <p className="text-xs text-blue-400 font-mono">{netStatus}</p>
                     </div>
                 )}
              </>
@@ -744,7 +704,7 @@ export default function App() {
               <span>|</span>
               <span className={isHost ? 'text-souls-gold' : 'text-blue-400'}>{isHost ? 'HOST' : 'CLIENT'}</span>
               <span>|</span>
-              {isConnected ? <Wifi size={14} className="text-green-500"/> : <WifiOff size={14} className="text-red-500"/>}
+              {isConnected ? <Server size={14} className="text-green-500"/> : <WifiOff size={14} className="text-red-500"/>}
               <span className={isConnected ? 'text-green-500' : 'text-red-500'}>
                   {isConnected ? 'ONLINE' : 'CONNECTING...'}
               </span>
