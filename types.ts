@@ -36,11 +36,13 @@ export interface Player {
   inventory: Item[];
   currentStats: Stats;
   wins: number;
+  isReady?: boolean; // For shop phase
 }
 
 export enum GamePhase {
   LOGIN = 'LOGIN',
   LOBBY = 'LOBBY',
+  WAITING_FOR_OPPONENT = 'WAITING_FOR_OPPONENT',
   SHOP = 'SHOP',
   BATTLE = 'BATTLE',
   ROUND_RESULT = 'ROUND_RESULT',
@@ -66,4 +68,12 @@ export interface GameState {
   currentTurnIndex: number; // 0 or 1
   roundWinnerId: string | null;
   gameWinnerId: string | null;
+}
+
+// Network Types
+export type MessageType = 'JOIN' | 'WELCOME' | 'SYNC' | 'ACTION_BUY' | 'ACTION_READY';
+
+export interface NetworkMessage {
+  type: MessageType;
+  payload?: any;
 }
