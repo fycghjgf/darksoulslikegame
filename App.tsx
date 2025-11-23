@@ -21,7 +21,14 @@ import {
   INVENTORY_LIMITS
 } from './constants';
 import { generateAiPurchases } from './services/geminiService';
-import { Skull, Crown, Users, Copy, Loader2, RefreshCw } from 'lucide-react';
+import { Skull, Crown, Users, Copy, Loader2, RefreshCw, Wifi, WifiOff } from 'lucide-react';
+
+// Declare PeerJS global
+declare global {
+  interface Window {
+    Peer: any;
+  }
+}
 
 const createPlayer = (id: string, name: string, isAi: boolean): Player => ({
   id,
@@ -47,6 +54,9 @@ const calculateStats = (player: Player): Stats => {
   return stats;
 };
 
+// PeerJS ID Prefix to avoid random collision on public server
+const APP_ID_PREFIX = 'souls-arena-game-v1-';
+
 export default function App() {
   // --- STATE ---
   const [gameState, setGameState] = useState<GameState>({
@@ -68,43 +78,215 @@ export default function App() {
   const [isHost, setIsHost] = useState(false);
   const [myPlayerId, setMyPlayerId] = useState<string>('');
   const [isConnected, setIsConnected] = useState(false);
+  const [peerStatus, setPeerStatus] = useState<string>('离线');
   
-  // REFS for Networking (Solves Stale Closures) and Async Locks
-  const channelRef = useRef<BroadcastChannel | null>(null);
+  // REFS for Networking and Logic
+  const peerRef = useRef<any>(null);
+  const connRef = useRef<any>(null); // The active P2P connection
   const isHostRef = useRef(false);
   const gameStateRef = useRef(gameState);
-  const connectionIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startingBattleRef = useRef(false);
 
   // Sync refs
   useEffect(() => { isHostRef.current = isHost; }, [isHost]);
   useEffect(() => { gameStateRef.current = gameState; }, [gameState]);
 
-  // --- NETWORKING HELPERS ---
-  const broadcast = useCallback((msg: NetworkMessage) => {
-    if (channelRef.current) {
+  // --- PEERJS HELPERS ---
+
+  // Helper to send message to the OTHER player
+  const send = useCallback((msg: NetworkMessage) => {
+    if (connRef.current && connRef.current.open) {
       try {
-        channelRef.current.postMessage(msg);
+        connRef.current.send(msg);
       } catch (e) {
-        console.error("Broadcast failed", e);
+        console.error("P2P Send failed", e);
       }
     }
   }, []);
 
-  // HOST HEARTBEAT: Broadcast state every 2s
+  // Handle incoming messages (Identical logic to before, just triggered by WebRTC data)
+  const handleMessage = useCallback((msg: NetworkMessage) => {
+    const amIHost = isHostRef.current;
+    
+    // console.log("Received:", msg.type, amIHost ? "(Host)" : "(Client)");
+
+    // --- CLIENT LOGIC ---
+    if (!amIHost) {
+      if (msg.type === 'SYNC' || msg.type === 'WELCOME') {
+        const serverState = msg.payload as GameState;
+        
+        // Optimistic connection check: if we got state, we are synced
+        if (!isConnected) setIsConnected(true);
+        
+        setGameState(serverState);
+      }
+      return;
+    } 
+
+    // --- HOST LOGIC ---
+    if (amIHost) {
+      if (msg.type === 'JOIN') {
+        const { id, name } = msg.payload;
+        
+        const currentState = gameStateRef.current;
+        const existingPlayer = currentState.players.find(p => p.id === id);
+        
+        if (existingPlayer) {
+            send({ type: 'SYNC', payload: currentState });
+            return;
+        }
+
+        if (currentState.players.length >= 2) {
+            return;
+        }
+
+        // Add new player
+        const p2 = createPlayer(id, name, false);
+        const newState = {
+            ...currentState,
+            players: [...currentState.players, p2],
+            phase: GamePhase.SHOP
+        };
+
+        setGameState(newState);
+        // Force send immediately to the specific connection that just joined
+        // Note: In 1v1 peerjs, connRef points to the single peer.
+        setTimeout(() => send({ type: 'WELCOME', payload: newState }), 100);
+        return;
+      }
+      
+      if (msg.type === 'ACTION_BUY') {
+        const { playerId, itemId } = msg.payload;
+        setGameState(prev => {
+            const newState = processBuyItem(prev, playerId, itemId);
+            setTimeout(() => send({ type: 'SYNC', payload: newState }), 0);
+            return newState;
+        });
+      }
+
+      if (msg.type === 'ACTION_READY') {
+         const { playerId } = msg.payload;
+         setGameState(prev => {
+             const updatedPlayers = prev.players.map(p => p.id === playerId ? { ...p, isReady: true } : p);
+             const newState = { ...prev, players: updatedPlayers };
+             send({ type: 'SYNC', payload: newState });
+             return newState;
+         });
+      }
+    }
+  }, [send, isConnected]); 
+
+  // --- INITIALIZE PEER (HOST) ---
+  const initHostPeer = (code: string) => {
+    if (peerRef.current) peerRef.current.destroy();
+
+    const peerId = `${APP_ID_PREFIX}${code}`;
+    const peer = new window.Peer(peerId, { debug: 1 });
+
+    setPeerStatus('正在建立房间...');
+
+    peer.on('open', (id: string) => {
+        // console.log('Host Peer Opened:', id);
+        setPeerStatus('房间已建立，等待连接...');
+        setIsConnected(true); // Host is "connected" to the signaling server
+    });
+
+    peer.on('connection', (conn: any) => {
+        // console.log('Host received connection!');
+        
+        // Clean up old connection if exists (1v1 only)
+        if (connRef.current) connRef.current.close();
+        
+        connRef.current = conn;
+        setPeerStatus('挑战者已连接!');
+
+        conn.on('data', (data: any) => handleMessage(data));
+        
+        conn.on('open', () => {
+             // Send current state immediately upon open
+             conn.send({ type: 'WELCOME', payload: gameStateRef.current });
+        });
+        
+        conn.on('close', () => {
+             setPeerStatus('挑战者已断开');
+             connRef.current = null;
+        });
+    });
+
+    peer.on('error', (err: any) => {
+        console.error('Peer Error:', err);
+        setPeerStatus(`网络错误: ${err.type}`);
+        if (err.type === 'unavailable-id') {
+            alert("房间代码已被占用，请重试或更换代码");
+        }
+    });
+
+    peerRef.current = peer;
+  };
+
+  // --- INITIALIZE PEER (CLIENT) ---
+  const initClientPeer = (code: string) => {
+     if (peerRef.current) peerRef.current.destroy();
+
+     // Client gets random ID
+     const peer = new window.Peer(null, { debug: 1 });
+     setPeerStatus('正在连接服务器...');
+
+     peer.on('open', (id: string) => {
+         // console.log('Client Peer Opened:', id);
+         setPeerStatus('正在寻找房间...');
+         
+         const hostId = `${APP_ID_PREFIX}${code}`;
+         const conn = peer.connect(hostId, { reliable: true });
+
+         conn.on('open', () => {
+             setPeerStatus('已连接到房间!');
+             setIsConnected(true);
+             connRef.current = conn;
+             
+             // Send handshake
+             conn.send({ 
+                 type: 'JOIN', 
+                 payload: { id: myPlayerId, name: localPlayerName } 
+             });
+         });
+
+         conn.on('data', (data: any) => handleMessage(data));
+         
+         conn.on('close', () => {
+             setPeerStatus('与房主断开连接');
+             setIsConnected(false);
+             connRef.current = null;
+         });
+         
+         conn.on('error', (err: any) => {
+             console.error("Conn Error", err);
+             setPeerStatus("连接失败");
+         });
+     });
+
+     peer.on('error', (err: any) => {
+         console.error('Peer Error:', err);
+         setPeerStatus(`连接失败: ${err.type}`);
+     });
+
+     peerRef.current = peer;
+  };
+
+  // HOST HEARTBEAT: Broadcast state every 2s to ensure sync
   useEffect(() => {
     if (!isHost || !gameState.roomCode) return;
     
     const interval = setInterval(() => {
-        if (gameStateRef.current.phase !== GamePhase.LOGIN) {
-            broadcast({ type: 'SYNC', payload: gameStateRef.current });
+        if (gameStateRef.current.phase !== GamePhase.LOGIN && connRef.current && connRef.current.open) {
+            send({ type: 'SYNC', payload: gameStateRef.current });
         }
     }, 2000);
 
     return () => clearInterval(interval);
-  }, [isHost, broadcast]); 
+  }, [isHost, send]); 
 
-  // Helper to process a buy action (state update only)
+  // --- HELPER LOGIC (Purchasing, Battle) ---
   const processBuyItem = (state: GameState, playerId: string, itemId: string): GameState => {
       const player = state.players.find(p => p.id === playerId);
       const item = SHOP_ITEMS.find(i => i.id === itemId);
@@ -127,99 +309,6 @@ export default function App() {
       return { ...state, players: updatedPlayers };
   };
 
-  // Handle incoming messages
-  const handleMessage = useCallback((msg: NetworkMessage) => {
-    const amIHost = isHostRef.current;
-
-    // --- CLIENT LOGIC ---
-    if (!amIHost) {
-      if (msg.type === 'SYNC' || msg.type === 'WELCOME') {
-        const serverState = msg.payload as GameState;
-        
-        // Check if I am in the game
-        const amIInList = serverState.players.some(p => p.id === myPlayerId);
-
-        if (amIInList) {
-             // SUCCESS: I am officially connected
-             if (connectionIntervalRef.current) {
-                 clearInterval(connectionIntervalRef.current);
-                 connectionIntervalRef.current = null;
-             }
-             setIsConnected(true);
-             setGameState(serverState);
-        }
-      }
-      return;
-    } 
-
-    // --- HOST LOGIC ---
-    if (amIHost) {
-      if (msg.type === 'JOIN') {
-        const { id, name } = msg.payload;
-        
-        // CRITICAL FIX: Determine action based on REF to avoid race conditions
-        const currentState = gameStateRef.current;
-        const existingPlayer = currentState.players.find(p => p.id === id);
-        
-        if (existingPlayer) {
-            // Already joined? Just send them the state immediately.
-            broadcast({ type: 'SYNC', payload: currentState });
-            return;
-        }
-
-        if (currentState.players.length >= 2) {
-            // Room full? Ignore or send error (optional)
-            return;
-        }
-
-        // Add new player
-        const p2 = createPlayer(id, name, false);
-        const newState = {
-            ...currentState,
-            players: [...currentState.players, p2],
-            phase: GamePhase.SHOP
-        };
-
-        // Update State
-        setGameState(newState);
-        
-        // Broadcast immediately (outside of setState)
-        broadcast({ type: 'WELCOME', payload: newState });
-        return;
-      }
-      
-      if (msg.type === 'ACTION_BUY') {
-        const { playerId, itemId } = msg.payload;
-        setGameState(prev => {
-            const newState = processBuyItem(prev, playerId, itemId);
-            setTimeout(() => broadcast({ type: 'SYNC', payload: newState }), 0);
-            return newState;
-        });
-      }
-
-      if (msg.type === 'ACTION_READY') {
-         const { playerId } = msg.payload;
-         setGameState(prev => {
-             const updatedPlayers = prev.players.map(p => p.id === playerId ? { ...p, isReady: true } : p);
-             const newState = { ...prev, players: updatedPlayers };
-             broadcast({ type: 'SYNC', payload: newState });
-             return newState;
-         });
-      }
-    }
-  }, [broadcast, myPlayerId]); 
-
-  // --- SETUP CHANNEL ---
-  const setupChannel = (code: string) => {
-    if (channelRef.current) {
-        channelRef.current.close();
-    }
-    // console.log(`Setting up channel: souls-room-${code}`);
-    const ch = new BroadcastChannel(`souls-room-${code}`);
-    ch.onmessage = (e) => handleMessage(e.data);
-    channelRef.current = ch;
-  };
-
   // --- GAME ACTIONS ---
 
   const handleLogin = () => {
@@ -230,11 +319,16 @@ export default function App() {
   };
 
   const handleCreateRoom = (mode: 'PVE' | 'PVP') => {
-    const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-    setupChannel(code);
+    // Generate a simple numeric code for easier typing on mobile, but append a random string internally for security if needed
+    // For this demo, let's use a 4 digit code to keep it simple
+    const code = Math.floor(1000 + Math.random() * 9000).toString();
+    
+    setGameState(prev => ({
+        ...prev,
+        roomCode: code,
+    }));
+    
     setIsHost(true);
-    setIsConnected(true);
-
     const p1 = createPlayer(myPlayerId, localPlayerName, false);
 
     if (mode === 'PVE') {
@@ -242,14 +336,14 @@ export default function App() {
       setGameState(prev => ({
         ...prev,
         phase: GamePhase.SHOP,
-        roomCode: code,
         players: [p1, p2]
       }));
+      // No networking needed for PvE really, but we leave it initialized in case
     } else {
+      initHostPeer(code);
       setGameState(prev => ({
         ...prev,
         phase: GamePhase.WAITING_FOR_OPPONENT,
-        roomCode: code,
         players: [p1] 
       }));
     }
@@ -257,49 +351,35 @@ export default function App() {
 
   const handleJoinRoom = () => {
     if (!roomInput.trim()) return;
-    const code = roomInput.trim().toUpperCase();
-    setupChannel(code);
+    const code = roomInput.trim();
+    
     setIsHost(false);
     setIsConnected(false);
     
-    // Set local state to waiting
     setGameState(prev => ({
         ...prev,
         roomCode: code,
         phase: GamePhase.WAITING_FOR_OPPONENT 
     }));
 
-    if (connectionIntervalRef.current) clearInterval(connectionIntervalRef.current);
-    
-    // POLL FOR ENTRY
-    const sendJoin = () => {
-        if (channelRef.current) {
-            channelRef.current.postMessage({ 
-                type: 'JOIN', 
-                payload: { id: myPlayerId, name: localPlayerName } 
-            });
-        }
-    };
-    sendJoin();
-    // Increase frequency slightly to catch host attention
-    connectionIntervalRef.current = setInterval(sendJoin, 800);
+    initClientPeer(code);
   };
 
   const handleBuyItemRequest = (itemId: string) => {
       if (!isHost) {
-          broadcast({ type: 'ACTION_BUY', payload: { playerId: myPlayerId, itemId } });
+          send({ type: 'ACTION_BUY', payload: { playerId: myPlayerId, itemId } });
           return;
       }
       setGameState(prev => {
           const newState = processBuyItem(prev, myPlayerId, itemId);
-          broadcast({ type: 'SYNC', payload: newState });
+          send({ type: 'SYNC', payload: newState });
           return newState;
       });
   };
 
   const handleShopReady = async () => {
     if (!isHost) {
-        broadcast({ type: 'ACTION_READY', payload: { playerId: myPlayerId } });
+        send({ type: 'ACTION_READY', payload: { playerId: myPlayerId } });
         // Optimistic update
         setGameState(prev => ({
             ...prev,
@@ -311,7 +391,7 @@ export default function App() {
     setGameState(prev => {
         const updatedPlayers = prev.players.map(p => p.id === myPlayerId ? { ...p, isReady: true } : p);
         const newState = { ...prev, players: updatedPlayers };
-        broadcast({ type: 'SYNC', payload: newState });
+        send({ type: 'SYNC', payload: newState });
         return newState;
     });
   };
@@ -326,7 +406,6 @@ export default function App() {
     
     if (allReady && !startingBattleRef.current) {
         startingBattleRef.current = true;
-        // console.log("Starting Battle Phase...");
         startBattlePhase().catch(err => {
             console.error("Error starting battle:", err);
             startingBattleRef.current = false;
@@ -369,7 +448,7 @@ export default function App() {
       };
 
       setGameState(battleStartState);
-      broadcast({ type: 'SYNC', payload: battleStartState });
+      send({ type: 'SYNC', payload: battleStartState });
   };
 
   // --- LOGIC: BATTLE ---
@@ -455,11 +534,10 @@ export default function App() {
         };
       }
       
-      // Host syncs after turn
-      broadcast({ type: 'SYNC', payload: nextState });
+      send({ type: 'SYNC', payload: nextState });
       return nextState;
     });
-  }, [isHost, broadcast]);
+  }, [isHost, send]);
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout>;
@@ -521,14 +599,13 @@ export default function App() {
         };
       }
       
-      broadcast({ type: 'SYNC', payload: nextState });
+      send({ type: 'SYNC', payload: nextState });
       return nextState;
     });
   };
 
   const resetGame = () => {
-    if (channelRef.current) channelRef.current.close();
-    if (connectionIntervalRef.current) clearInterval(connectionIntervalRef.current);
+    if (peerRef.current) peerRef.current.destroy();
     
     setGameState({
       phase: GamePhase.LOBBY,
@@ -543,6 +620,7 @@ export default function App() {
     });
     setIsHost(false);
     setIsConnected(false);
+    setPeerStatus('离线');
   };
 
   // --- RENDERS ---
@@ -622,7 +700,9 @@ export default function App() {
                 <Loader2 className="w-16 h-16 text-souls-gold animate-spin" />
                 <div className="text-center">
                     <h2 className="text-2xl font-display text-white mb-2">等待挑战者...</h2>
-                    <p className="text-souls-muted mb-6">分享此代码给你的对手</p>
+                    <p className="text-souls-muted mb-2">分享此代码给你的对手 (不同设备可用)</p>
+                    <p className="text-xs text-blue-400 mb-6 font-mono">{peerStatus}</p>
+
                     <div className="flex items-center gap-4 bg-souls-gray/30 p-4 rounded border border-souls-gold/30">
                         <span className="text-4xl font-mono font-bold text-souls-gold tracking-[0.5em]">{gameState.roomCode}</span>
                         <button onClick={() => navigator.clipboard.writeText(gameState.roomCode || '')} className="p-2 hover:bg-white/10 rounded">
@@ -638,12 +718,14 @@ export default function App() {
                         <Users className="w-16 h-16 text-green-500" />
                         <h2 className="text-2xl font-display text-white">已连接!</h2>
                         <p className="text-souls-muted">等待房主开始...</p>
+                        <p className="text-xs text-blue-400 font-mono">{peerStatus}</p>
                     </div>
                 ) : (
                     <div className="flex flex-col items-center gap-4">
                         <RefreshCw className="w-16 h-16 text-souls-red animate-spin" />
                         <h2 className="text-2xl font-display text-white">正在入侵世界 {gameState.roomCode}...</h2>
-                        <p className="text-souls-muted">正在同步灵体频率...</p>
+                        <p className="text-souls-muted">正在搜寻灵体频率 (PeerP2P)...</p>
+                        <p className="text-xs text-blue-400 font-mono">{peerStatus}</p>
                     </div>
                 )}
              </>
@@ -657,13 +739,14 @@ export default function App() {
   return (
     <Layout>
       {gameState.roomCode && (
-          <div className="absolute top-4 right-4 z-50 bg-black/50 px-3 py-1 border border-white/10 text-xs text-souls-muted font-mono flex gap-2">
+          <div className="absolute top-4 right-4 z-50 bg-black/50 px-3 py-1 border border-white/10 text-xs text-souls-muted font-mono flex gap-2 items-center">
               <span>ROOM: {gameState.roomCode}</span>
               <span>|</span>
               <span className={isHost ? 'text-souls-gold' : 'text-blue-400'}>{isHost ? 'HOST' : 'CLIENT'}</span>
               <span>|</span>
-              <span className={isConnected || isHost ? 'text-green-500' : 'text-red-500'}>
-                  {isConnected || isHost ? 'ONLINE' : 'CONNECTING...'}
+              {isConnected ? <Wifi size={14} className="text-green-500"/> : <WifiOff size={14} className="text-red-500"/>}
+              <span className={isConnected ? 'text-green-500' : 'text-red-500'}>
+                  {isConnected ? 'ONLINE' : 'CONNECTING...'}
               </span>
           </div>
       )}
