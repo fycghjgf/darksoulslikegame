@@ -21,7 +21,7 @@ import {
   INVENTORY_LIMITS
 } from './constants';
 import { generateAiPurchases } from './services/geminiService';
-import { Skull, Crown, Users, Copy, Loader2 } from 'lucide-react';
+import { Skull, Crown, Users, Copy, Loader2, RefreshCw } from 'lucide-react';
 
 const createPlayer = (id: string, name: string, isAi: boolean): Player => ({
   id,
@@ -67,13 +67,18 @@ export default function App() {
   // Networking State
   const [isHost, setIsHost] = useState(false);
   const [myPlayerId, setMyPlayerId] = useState<string>('');
+  const [isConnected, setIsConnected] = useState(false);
   
-  // REFS for Networking
+  // REFS for Networking (Solves Stale Closures) and Async Locks
   const channelRef = useRef<BroadcastChannel | null>(null);
   const isHostRef = useRef(false);
-  const connectionIntervalRef = useRef<any>(null);
+  const gameStateRef = useRef(gameState);
+  const connectionIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const startingBattleRef = useRef(false);
 
+  // Sync refs
   useEffect(() => { isHostRef.current = isHost; }, [isHost]);
+  useEffect(() => { gameStateRef.current = gameState; }, [gameState]);
 
   // --- NETWORKING HELPERS ---
   const broadcast = useCallback((msg: NetworkMessage) => {
@@ -81,6 +86,20 @@ export default function App() {
       channelRef.current.postMessage(msg);
     }
   }, []);
+
+  // HOST HEARTBEAT: Broadcast state every 2s to ensure clients sync even if they miss packets
+  useEffect(() => {
+    if (!isHost || !gameState.roomCode) return;
+    
+    const interval = setInterval(() => {
+        // Only broadcast if we have players (or waiting for them)
+        if (gameStateRef.current.phase !== GamePhase.LOGIN) {
+            broadcast({ type: 'SYNC', payload: gameStateRef.current });
+        }
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [isHost, broadcast]); // Intentionally minimal dependencies, uses gameStateRef
 
   // Helper to process a buy action (state update only)
   const processBuyItem = (state: GameState, playerId: string, itemId: string): GameState => {
@@ -92,7 +111,6 @@ export default function App() {
       // CHECK LIMITS
       const typeCount = player.inventory.filter(i => i.type === item.type).length;
       if (typeCount >= INVENTORY_LIMITS[item.type]) {
-          console.warn(`Cannot buy ${item.name}: Limit reached for ${item.type}`);
           return state;
       }
 
@@ -113,40 +131,58 @@ export default function App() {
 
     // --- CLIENT LOGIC ---
     if (!amIHost) {
-      if (msg.type === 'WELCOME') {
-        if (connectionIntervalRef.current) {
-            clearInterval(connectionIntervalRef.current);
-            connectionIntervalRef.current = null;
+      if (msg.type === 'SYNC' || msg.type === 'WELCOME') {
+        const serverState = msg.payload as GameState;
+        
+        // Check if I am in the game
+        const amIInList = serverState.players.some(p => p.id === myPlayerId);
+
+        if (amIInList) {
+             // SUCCESS: I am officially connected
+             if (connectionIntervalRef.current) {
+                 clearInterval(connectionIntervalRef.current);
+                 connectionIntervalRef.current = null;
+             }
+             setIsConnected(true);
+             setGameState(serverState);
+        } else {
+             // FAILURE: I am not in the list yet. Keep retrying (handled by handleJoinRoom interval)
+             // But we can optionally sync the phase if we want to see the lobby
         }
-        setGameState(msg.payload);
-      }
-      
-      if (msg.type === 'SYNC') {
-        setGameState(msg.payload);
       }
       return;
     } 
 
     // --- HOST LOGIC ---
     if (amIHost) {
-      if (msg.type === 'JOIN') {
-        setGameState(prev => {
-           const existingP2 = prev.players[1];
-           if (existingP2 && existingP2.id === msg.payload.id) {
-               setTimeout(() => broadcast({ type: 'WELCOME', payload: prev }), 50);
-               return prev;
-           }
-           if (existingP2 && existingP2.id !== msg.payload.id) return prev;
+      const current = gameStateRef.current;
 
-           const p1 = prev.players[0];
+      if (msg.type === 'JOIN') {
+        // Idempotency check: Is player already in?
+        const existingPlayer = current.players.find(p => p.id === msg.payload.id);
+        if (existingPlayer) {
+            // Already joined, just resend state immediately so they stop asking
+            broadcast({ type: 'SYNC', payload: current });
+            return;
+        }
+
+        // Add new player
+        setGameState(prev => {
+           // Double check inside setter to prevent race conditions
+           if (prev.players.find(p => p.id === msg.payload.id)) return prev;
+           
+           // If p2 spot is taken by someone else, ignore
+           if (prev.players.length >= 2) return prev;
+
            const p2 = createPlayer(msg.payload.id, msg.payload.name, false);
            const newState = {
              ...prev,
-             players: [p1, p2],
+             players: [...prev.players, p2],
              phase: GamePhase.SHOP
            };
            
-           setTimeout(() => broadcast({ type: 'WELCOME', payload: newState }), 50);
+           // Immediate response
+           setTimeout(() => broadcast({ type: 'WELCOME', payload: newState }), 0);
            return newState;
         });
       }
@@ -170,14 +206,18 @@ export default function App() {
          });
       }
     }
-  }, [broadcast]);
+  }, [broadcast, myPlayerId]); // Add myPlayerId to deps
 
-  useEffect(() => {
-     if (channelRef.current) {
-         channelRef.current.onmessage = (e) => handleMessage(e.data);
-     }
-  }, [handleMessage]);
-
+  // --- SETUP CHANNEL ---
+  const setupChannel = (code: string) => {
+    if (channelRef.current) {
+        channelRef.current.close();
+    }
+    console.log(`Setting up channel: souls-room-${code}`);
+    const ch = new BroadcastChannel(`souls-room-${code}`);
+    ch.onmessage = (e) => handleMessage(e.data);
+    channelRef.current = ch;
+  };
 
   // --- GAME ACTIONS ---
 
@@ -188,17 +228,11 @@ export default function App() {
     setGameState(prev => ({ ...prev, phase: GamePhase.LOBBY }));
   };
 
-  const setupChannel = (code: string) => {
-    if (channelRef.current) channelRef.current.close();
-    const ch = new BroadcastChannel(`souls-room-${code}`);
-    ch.onmessage = (e) => handleMessage(e.data);
-    channelRef.current = ch;
-  };
-
   const handleCreateRoom = (mode: 'PVE' | 'PVP') => {
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
     setupChannel(code);
     setIsHost(true);
+    setIsConnected(true);
 
     const p1 = createPlayer(myPlayerId, localPlayerName, false);
 
@@ -225,7 +259,9 @@ export default function App() {
     const code = roomInput.trim().toUpperCase();
     setupChannel(code);
     setIsHost(false);
+    setIsConnected(false); // Reset connection status
     
+    // Set local state to waiting, so UI updates
     setGameState(prev => ({
         ...prev,
         roomCode: code,
@@ -234,8 +270,11 @@ export default function App() {
 
     if (connectionIntervalRef.current) clearInterval(connectionIntervalRef.current);
     
+    // POLL FOR ENTRY
+    // We keep sending JOIN requests until we receive a SYNC containing our ID
     const sendJoin = () => {
         if (channelRef.current) {
+            console.log("Sending JOIN request...");
             channelRef.current.postMessage({ 
                 type: 'JOIN', 
                 payload: { id: myPlayerId, name: localPlayerName } 
@@ -261,6 +300,7 @@ export default function App() {
   const handleShopReady = async () => {
     if (!isHost) {
         broadcast({ type: 'ACTION_READY', payload: { playerId: myPlayerId } });
+        // Optimistic update for UI responsiveness
         setGameState(prev => ({
             ...prev,
             players: prev.players.map(p => p.id === myPlayerId ? { ...p, isReady: true } : p)
@@ -276,14 +316,27 @@ export default function App() {
     });
   };
 
+  // CHECK IF ALL READY (HOST ONLY)
   useEffect(() => {
     if (!isHost) return;
     if (gameState.phase !== GamePhase.SHOP) return;
+    if (gameState.players.length < 2) return;
     
-    const allReady = gameState.players.length === 2 && gameState.players.every(p => p.isReady);
+    // Fix: In PvE, the AI is always ready. In PvP, we wait for both.
+    const allReady = gameState.players.every(p => p.isReady || p.isAi);
     
-    if (allReady) {
-        startBattlePhase();
+    if (allReady && !startingBattleRef.current) {
+        startingBattleRef.current = true;
+        console.log("Starting Battle Phase...");
+        startBattlePhase().catch(err => {
+            console.error("Error starting battle:", err);
+            startingBattleRef.current = false;
+        }).finally(() => {
+            // Once we start, we don't expect to run this effect again until next shop phase
+            // We release the lock at end of phase transition if needed, but since
+            // component state changes to BATTLE, this useEffect won't run again immediately.
+            startingBattleRef.current = false;
+        });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gameState.players, gameState.phase, isHost]);
@@ -300,10 +353,12 @@ export default function App() {
           const aiInventory = [...aiPlayer.inventory];
           itemsToBuyIds.forEach(id => {
               const item = SHOP_ITEMS.find(i => i.id === id);
-              // Simple check for AI limits
+              if (!item) return;
+
+              // Simple check for limits in AI logic (though gemini service should handle, good to double check)
               const typeCount = aiInventory.filter(aiI => aiI.type === item.type).length;
 
-              if (item && item.cost <= aiSouls && typeCount < INVENTORY_LIMITS[item.type]) {
+              if (item.cost <= aiSouls && typeCount < INVENTORY_LIMITS[item.type]) {
                   aiSouls -= item.cost;
                   aiInventory.push(item);
               }
@@ -355,16 +410,16 @@ export default function App() {
          scalingDmg += attacker.currentStats.str * 0.5;
       }
 
-      // Red Tearstone Ring Logic: +50% dmg if HP < 20%
+      // Red Tearstone Ring Logic
       const hasRTSR = attacker.inventory.some(i => i.id === 'r_rtsr');
-      const lowHp = (attacker.currentStats.hp / (100 + (attacker.inventory.reduce((a,i)=>a+(i.stats.hp||0),0)))) < 0.2;
+      const maxHp = 100 + (attacker.inventory.reduce((a,i)=>a+(i.stats.hp||0),0));
+      const lowHp = (attacker.currentStats.hp / maxHp) < 0.2;
       let dmgMultiplier = 1;
       if (hasRTSR && lowHp) dmgMultiplier = 1.5;
 
       const rawDmg = (baseDmg + scalingDmg) * dmgMultiplier;
       const mitigation = defender.currentStats.def;
       
-      // Magic penetrates defense better? Let's keep it simple: Raw - Def
       const finalDmg = Math.max(1, Math.floor(rawDmg - mitigation));
       
       const isCrit = Math.random() < (attacker.currentStats.dex * 0.01);
@@ -408,6 +463,7 @@ export default function App() {
         };
       }
       
+      // Host syncs after turn
       broadcast({ type: 'SYNC', payload: nextState });
       return nextState;
     });
@@ -495,6 +551,7 @@ export default function App() {
       gameWinnerId: null
     });
     setIsHost(false);
+    setIsConnected(false);
   };
 
   // --- RENDERS ---
@@ -585,9 +642,19 @@ export default function App() {
               </>
           ) : (
              <>
-                <Loader2 className="w-16 h-16 text-souls-text animate-spin" />
-                <h2 className="text-2xl font-display text-white">正在入侵世界 {gameState.roomCode}...</h2>
-                <p className="text-souls-muted">连接中... (如果长时间未响应，请检查代码)</p>
+                {isConnected ? (
+                    <div className="flex flex-col items-center gap-4">
+                        <Users className="w-16 h-16 text-green-500" />
+                        <h2 className="text-2xl font-display text-white">已连接!</h2>
+                        <p className="text-souls-muted">等待房主开始...</p>
+                    </div>
+                ) : (
+                    <div className="flex flex-col items-center gap-4">
+                        <RefreshCw className="w-16 h-16 text-souls-red animate-spin" />
+                        <h2 className="text-2xl font-display text-white">正在入侵世界 {gameState.roomCode}...</h2>
+                        <p className="text-souls-muted">正在同步灵体频率...</p>
+                    </div>
+                )}
              </>
           )}
           <button onClick={resetGame} className="mt-8 text-sm text-red-500 hover:underline">取消</button>
@@ -599,15 +666,20 @@ export default function App() {
   return (
     <Layout>
       {gameState.roomCode && (
-          <div className="absolute top-4 right-4 z-50 bg-black/50 px-3 py-1 border border-white/10 text-xs text-souls-muted font-mono">
-              ROOM: {gameState.roomCode} | {isHost ? 'HOST' : 'CLIENT'}
+          <div className="absolute top-4 right-4 z-50 bg-black/50 px-3 py-1 border border-white/10 text-xs text-souls-muted font-mono flex gap-2">
+              <span>ROOM: {gameState.roomCode}</span>
+              <span>|</span>
+              <span className={isHost ? 'text-souls-gold' : 'text-blue-400'}>{isHost ? 'HOST' : 'CLIENT'}</span>
+              <span>|</span>
+              <span className={isConnected || isHost ? 'text-green-500' : 'text-red-500'}>
+                  {isConnected || isHost ? 'ONLINE' : 'CONNECTING...'}
+              </span>
           </div>
       )}
 
-      {/* GAME OVER SCREEN - Updated to Red 'YOU DIED' style */}
+      {/* GAME OVER SCREEN */}
       {gameState.phase === GamePhase.GAME_OVER && (
           <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black animate-fade-in">
-             {/* Blood stain effect */}
              <div className="absolute inset-0 bg-red-900/20 mix-blend-overlay pointer-events-none"></div>
              
              <h1 className={`text-6xl md:text-9xl font-display mb-8 tracking-widest uppercase scale-150 drop-shadow-[0_0_30px_rgba(139,0,0,0.8)] text-center animate-you-died ${
@@ -647,9 +719,12 @@ export default function App() {
             <div className="flex justify-between items-center mb-4 border-b border-white/10 pb-2">
                  <div className="flex gap-4">
                      {gameState.players.map(p => (
-                         <div key={p.id} className={`flex items-center gap-2 ${p.wins > 0 ? 'text-souls-gold' : 'text-gray-500'} ${p.isReady ? 'opacity-100' : 'opacity-70'}`}>
+                         <div key={p.id} className={`flex items-center gap-2 ${p.wins > 0 ? 'text-souls-gold' : 'text-gray-500'} ${(p.isReady || p.isAi) ? 'opacity-100' : 'opacity-70'}`}>
                              <Crown size={16} className={p.wins > 0 ? 'fill-current' : ''} />
-                             <span className="font-bold">{p.name} {p.isReady && <span className="text-xs text-green-500 ml-1">[已准备]</span>}</span>
+                             <span className="font-bold">
+                                {p.name} 
+                                {(p.isReady || p.isAi) && <span className="text-xs text-green-500 ml-1">[已准备]</span>}
+                             </span>
                          </div>
                      ))}
                  </div>
